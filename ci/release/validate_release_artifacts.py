@@ -16,6 +16,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import validate_key_metadata as key_metadata
 
@@ -28,6 +29,7 @@ ALLOWED_ARTIFACT_SUFFIXES = (".tar.gz", ".tar.xz", ".zip", ".dmg", ".exe")
 SHA256SUMS_LINE_RE = re.compile(r"^([0-9A-Fa-f]{64}) ([ *])(.+)$")
 FINGERPRINT_RE = re.compile(r"^[0-9A-F]{40}$")
 RELEASE_SIGNATURE_RE = re.compile(r"^SHA256SUMS\.([a-z0-9][a-z0-9-]{2,31})\.asc$")
+OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 class ReleaseValidationError(Exception):
@@ -298,14 +300,18 @@ def run_command(
     *,
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
-) -> subprocess.CompletedProcess[str]:
+    text: bool = True,
+) -> subprocess.CompletedProcess[Any]:
+    """Run `command`. Output that gets parsed is read as bytes (text=False): text
+    mode would also turn a carriage return into a line feed."""
+
     return subprocess.run(
         command,
         check=False,
         capture_output=True,
         cwd=cwd,
         env=env,
-        text=True,
+        text=text,
     )
 
 
@@ -327,15 +333,19 @@ def import_release_keys(
             )
 
     result = run_command(
-        [gpg, "--batch", "--homedir", str(gnupg_home), "--with-colons", "--fingerprint", "--list-keys"]
+        [gpg, "--batch", "--homedir", str(gnupg_home), "--with-colons", "--fingerprint", "--list-keys"],
+        text=False,
     )
     if result.returncode != 0:
-        raise ReleaseValidationError(f"Failed to list imported release keys:\n{result.stderr}")
+        raise ReleaseValidationError(f"Failed to list imported release keys:\n{key_metadata.shown(result.stderr)}")
 
     imported: set[str] = set()
-    for line in result.stdout.splitlines():
-        fields = line.split(":")
-        if fields and fields[0] == "fpr" and len(fields) > 9:
+    try:
+        records = key_metadata.colon_records(result.stdout, "gpg's listing of the imported release keys")
+    except key_metadata.GpgOutputError as exc:
+        raise ReleaseValidationError(str(exc)) from exc
+    for fields in records:
+        if fields[0] == "fpr" and len(fields) > 9:
             imported.add(normalize_fingerprint(fields[9]))
 
     missing_fingerprints = sorted(policy.active_fingerprints - imported)
@@ -346,15 +356,19 @@ def import_release_keys(
         )
 
 
-def status_fingerprints(status_output: str) -> list[str]:
-    fingerprints: list[str] = []
-    for line in status_output.splitlines():
-        if not line.startswith("[GNUPG:] VALIDSIG "):
-            continue
-        fields = line.split()
-        if len(fields) >= 3:
-            fingerprints.append(normalize_fingerprint(fields[2]))
-    return fingerprints
+def good_signatures(status_output: bytes, what: str, source: str = "gpg status output") -> list[tuple[str, str]]:
+    """validate_key_metadata.good_signatures, refusing what it cannot read as a release validation error."""
+
+    try:
+        return key_metadata.good_signatures(status_output, source)
+    except key_metadata.MetadataError as exc:
+        raise ReleaseValidationError(f"{what}: {exc}") from exc
+
+
+def status_fingerprints(status_output: bytes, what: str = "gpg", source: str = "gpg status output") -> list[str]:
+    """Signing-key fingerprints of the good signatures (validate_key_metadata.good_signatures)."""
+
+    return [signing for signing, _primary in good_signatures(status_output, what, source)]
 
 
 def verify_detached_signature_file(
@@ -362,6 +376,8 @@ def verify_detached_signature_file(
     gnupg_home: Path,
     signature: Path,
     checksums: Path,
+    *,
+    primary_fingerprints: set[str] | None = None,
 ) -> set[str]:
     if not signature.is_file():
         raise ReleaseValidationError(f"Missing required release file: {signature}")
@@ -380,15 +396,19 @@ def verify_detached_signature_file(
         str(signature),
         str(checksums),
     ]
-    result = run_command(command)
+    result = run_command(command, text=False)
     if result.returncode != 0:
         raise ReleaseValidationError(
-            f"{signature.name} does not verify against SHA256SUMS:\n{result.stdout}{result.stderr}"
+            f"{signature.name} does not verify against SHA256SUMS:\n"
+            f"{key_metadata.shown(result.stdout)}{key_metadata.shown(result.stderr)}"
         )
 
-    valid_fingerprints = set(status_fingerprints(result.stdout))
+    good = good_signatures(result.stdout, signature.name)
+    valid_fingerprints = {signing for signing, _primary in good}
     if not valid_fingerprints:
         raise ReleaseValidationError(f"GPG verification produced no valid signature for {signature.name}")
+    if primary_fingerprints is not None:
+        primary_fingerprints.update(primary for _signing, primary in good)
     return valid_fingerprints
 
 
@@ -398,8 +418,13 @@ def verify_manifest_signature_file(
     signature: Path,
     checksums: Path,
     signer: ReleaseSigner,
-) -> None:
-    valid_fingerprints = verify_detached_signature_file(gpg, gnupg_home, signature, checksums)
+) -> str:
+    """Verify one operator's signature and return its primary-key fingerprint."""
+
+    primaries: set[str] = set()
+    valid_fingerprints = verify_detached_signature_file(
+        gpg, gnupg_home, signature, checksums, primary_fingerprints=primaries
+    )
 
     expected = {signer.fingerprint}
     unexpected = sorted(valid_fingerprints - expected)
@@ -412,6 +437,9 @@ def verify_manifest_signature_file(
         raise ReleaseValidationError(
             f"{signature.name} was not signed by expected fingerprint {signer.fingerprint}"
         )
+    if len(primaries) != 1:
+        raise ReleaseValidationError(f"{signature.name} did not name exactly one primary key")
+    return primaries.pop()
 
 
 def verify_combined_manifest_signature_file(
@@ -458,16 +486,24 @@ def verify_manifest_signatures(
     checksums = artifacts_dir / CHECKSUMS_FILE
     staged = staged_file_names(artifacts_dir)
     signatures = release_signature_paths(artifacts_dir, staged, policy)
+    # Quorum counts distinct primary keys: signers whose signing keys share one
+    # primary key count once.
     counted: list[str] = []
+    verified: set[str] = set()
+    primaries: dict[str, str] = {}
     for alias, signature in sorted(signatures.items()):
         signer = policy.signers_by_alias[alias]
-        verify_manifest_signature_file(gpg, gnupg_home, signature, checksums, signer)
+        primary = verify_manifest_signature_file(gpg, gnupg_home, signature, checksums, signer)
+        verified.add(alias)
+        if primary in primaries:
+            continue
+        primaries[primary] = alias
         counted.append(alias)
 
     if len(counted) < policy.signature_quorum:
         raise ReleaseValidationError(
             f"Release signature quorum not met for {policy.release_line}: "
-            f"got {len(counted)} valid active release signer signature(s), "
+            f"got {len(counted)} valid active release signer signature(s) by distinct primary keys, "
             f"need {policy.signature_quorum}; counted={', '.join(counted) or 'none'}"
         )
 
@@ -477,7 +513,7 @@ def verify_manifest_signatures(
         artifacts_dir / "SHA256SUMS.asc",
         checksums,
         policy,
-        set(counted),
+        verified,
     )
     return tuple(counted)
 
@@ -487,16 +523,22 @@ def verify_tag_signature(
 ) -> None:
     env = os.environ.copy()
     env["GNUPGHOME"] = str(gnupg_home)
+    # A tag object ID, or the tag's full ref name, which git finds before any
+    # other ref; core.warnAmbiguousRefs=false keeps git from warning about such
+    # refs on standard error, which must hold gpg's status lines only.
+    name = tag if OBJECT_ID_RE.fullmatch(tag) else f"refs/tags/{tag}"
     result = run_command(
-        ["git", "-c", f"gpg.program={gpg}", "verify-tag", "--raw", tag],
+        ["git", "-c", f"gpg.program={gpg}", "-c", "core.warnAmbiguousRefs=false", "verify-tag", "--raw", name],
         env=env,
+        text=False,
     )
     if result.returncode != 0:
         raise ReleaseValidationError(
             f"Release tag {tag} was not signed by an active qbit release key:\n"
-            f"{result.stdout}{result.stderr}"
+            f"{key_metadata.shown(result.stdout)}{key_metadata.shown(result.stderr)}"
         )
-    valid_fingerprints = status_fingerprints(result.stdout + result.stderr)
+    # --raw: gpg's status lines, and only those, on standard error.
+    valid_fingerprints = status_fingerprints(result.stderr, f"Release tag {tag}", "git verify-tag --raw output")
     counted = sorted(set(valid_fingerprints) & policy.active_fingerprints)
     if not counted:
         raise ReleaseValidationError(

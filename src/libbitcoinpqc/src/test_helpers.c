@@ -21,6 +21,7 @@
 #include "hash.h"
 #include "opt_flags.h"
 #include "randombytes.h"
+#include "sha2.h"
 #include "sign_stats.h"
 
 void slh_dsa_restore_original_random(void);
@@ -271,6 +272,16 @@ int bitcoin_pqc_test_runtime_env_knobs_enabled(void)
 int bitcoin_pqc_test_sha_backend_mode(void)
 {
     return spx_opt_sha_backend_mode();
+}
+
+int bitcoin_pqc_test_sha256_impl(void)
+{
+    return spx_sha2_test_sha256_impl();
+}
+
+int bitcoin_pqc_test_sha512_impl(void)
+{
+    return spx_sha2_test_sha512_impl();
 }
 
 int bitcoin_pqc_test_disable_sha_accel(void)

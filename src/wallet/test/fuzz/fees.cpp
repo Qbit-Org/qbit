@@ -38,10 +38,12 @@ FUZZ_TARGET(wallet_fees, .init = initialize_setup)
 
     if (fuzzed_data_provider.ConsumeBool()) {
         wallet.m_fallback_fee = CFeeRate{ConsumeMoney(fuzzed_data_provider, /*max=*/COIN)};
+        wallet.m_allow_fallback_fee = wallet.m_fallback_fee != CFeeRate{0};
     }
 
     if (fuzzed_data_provider.ConsumeBool()) {
         wallet.m_discard_rate = CFeeRate{ConsumeMoney(fuzzed_data_provider, /*max=*/COIN)};
+        wallet.m_discard_rate_set = true;
     }
     (void)GetDiscardRate(wallet);
 

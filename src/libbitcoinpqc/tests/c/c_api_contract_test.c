@@ -3,9 +3,26 @@
 #include <string.h>
 
 #include "libbitcoinpqc/bitcoinpqc.h"
+#include "libbitcoinpqc/slh_dsa.h"
 
 #define MIN_ENTROPY_SIZE 128u
 #define LONG_ENTROPY_SIZE 160u
+
+/* Keygen hashes [domain || 0 || len || entropy] through a heap buffer that
+   grows with the entropy size. A size this close to SIZE_MAX passes the
+   overflow check but asks malloc for more than PTRDIFF_MAX bytes, which every
+   supported allocator refuses before the entropy is ever read. AddressSanitizer
+   aborts on such a request instead of returning NULL, so the test is skipped
+   there. */
+#define UNSATISFIABLE_ENTROPY_SIZE (SIZE_MAX - 1024u)
+
+#if defined(__SANITIZE_ADDRESS__)
+#define CONTRACT_TEST_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define CONTRACT_TEST_ASAN 1
+#endif
+#endif
 
 static void fill_entropy(uint8_t *out, size_t len, uint8_t seed) {
     size_t i;
@@ -354,6 +371,46 @@ cleanup:
     return failed;
 }
 
+static int test_keygen_reports_failed_allocation_as_out_of_memory(void) {
+#if defined(CONTRACT_TEST_ASAN)
+    printf("keygen allocation-failure test skipped under AddressSanitizer\n");
+    return 0;
+#else
+    uint8_t entropy[MIN_ENTROPY_SIZE];
+    uint8_t pk[SLH_DSA_PUBLIC_KEY_SIZE];
+    uint8_t sk[SLH_DSA_SECRET_KEY_SIZE];
+    bitcoin_pqc_keypair_t keypair = {0};
+    bitcoin_pqc_error_t rc;
+    int low_level_rc;
+
+    fill_entropy(entropy, sizeof(entropy), 0x50u);
+
+    low_level_rc = slh_dsa_keygen(pk, sk, entropy, UNSATISFIABLE_ENTROPY_SIZE);
+    if (low_level_rc != SLH_DSA_KEYGEN_ERROR_OUT_OF_MEMORY) {
+        fprintf(stderr,
+                "slh_dsa_keygen should report a failed seed allocation: rc=%d expected=%d\n",
+                low_level_rc,
+                SLH_DSA_KEYGEN_ERROR_OUT_OF_MEMORY);
+        return 1;
+    }
+
+    rc = bitcoin_pqc_keygen(&keypair, entropy, UNSATISFIABLE_ENTROPY_SIZE);
+    if (rc != BITCOIN_PQC_ERROR_OUT_OF_MEMORY) {
+        fprintf(stderr,
+                "bitcoin_pqc_keygen should report a failed seed allocation as OUT_OF_MEMORY: rc=%d\n",
+                (int)rc);
+        bitcoin_pqc_keypair_free(&keypair);
+        return 1;
+    }
+    if (!keypair_is_empty(&keypair)) {
+        bitcoin_pqc_keypair_free(&keypair);
+        return fail("failed keygen allocation mutated keypair output");
+    }
+
+    return 0;
+#endif
+}
+
 static int test_keygen_uses_all_entropy_bytes(void) {
     if (assert_entropy_mutation_changes_keypair(MIN_ENTROPY_SIZE, 48u)) {
         return 1;
@@ -371,6 +428,7 @@ int main(void) {
     if (test_keygen_output_lifecycle() ||
         test_signature_output_lifecycle() ||
         test_null_empty_message_sign_verify() ||
+        test_keygen_reports_failed_allocation_as_out_of_memory() ||
         test_keygen_uses_all_entropy_bytes()) {
         return 1;
     }

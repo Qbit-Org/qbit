@@ -500,6 +500,22 @@ class CTestNetParams : public CChainParams {
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_artifacts_dir_ignores_darwin_debug_core_artifacts(self) -> None:
+        # The macOS debug tarballs are named like the Linux ones and are not
+        # qbitd posture artifacts, whatever their members are called.
+        debug_names = {
+            "qbit-0.1.0-arm64-apple-darwin-debug.tar.gz",
+            "qbit-0.1.0-x86_64-apple-darwin-debug.tar.gz",
+        }
+        artifacts_dir = self.write_staged_qbitd_evidence(
+            extra_artifacts={name: b"dSYM bundle" for name in debug_names},
+            omit_qbitd_artifacts=debug_names,
+        )
+
+        result = self.run_verifier("--artifacts-dir", str(artifacts_dir))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_artifacts_dir_honors_unsigned_platform_waiver(self) -> None:
         unsigned_name = "qbit-0.1.0-x86_64-apple-darwin-unsigned.zip"
         artifacts_dir = self.write_staged_qbitd_evidence(

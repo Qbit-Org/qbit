@@ -11,7 +11,7 @@ is updated to 12.x or newer.
 
 --- a/qtbase/src/corelib/global/qtypes.h
 +++ b/qtbase/src/corelib/global/qtypes.h
-@@ -258,23 +258,8 @@ using qsizetype = QIntegerForSizeof<std::size_t>::Signed;
+@@ -274,23 +274,8 @@ using qsizetype = QIntegerForSizeof<std::size_t>::Signed;
  
  // Define a native float16 type
  namespace QtPrivate {

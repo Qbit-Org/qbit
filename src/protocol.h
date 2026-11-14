@@ -361,6 +361,15 @@ std::vector<std::string> serviceFlagsToStr(uint64_t flags);
 constexpr ServiceFlags SeedsServiceFlags() { return ServiceFlags(NODE_NETWORK | NODE_WITNESS | NODE_ARCHIVE); }
 
 /**
+ * Service flags that count against connecting to an address (see
+ * PeerManager::HasUndesirableServiceFlags()). They are only kept for an
+ * address when its peer advertised them in its version message on a
+ * connection we made to it: they are dropped from relayed addresses and from
+ * addresses read from disk, and are learned again from the peer.
+ */
+constexpr ServiceFlags DirectOnlyServiceFlags() { return NODE_WITNESS_PRUNED; }
+
+/**
  * Checks if a peer with the given service flags may be capable of having a
  * robust address-storage DB.
  */

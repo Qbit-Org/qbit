@@ -32,6 +32,10 @@ static_assert(PQC_KEYGEN_RANDOM_DATA_SIZE >= 128);
 // SLH-DSA-SHA2-128s-bounded30 usage bound.
 constexpr uint32_t PQC_MAX_SIGNATURES = 1U << 30;
 
+//! Bytes of released stack that CPQCKey and DerivePQCKey overwrite after each
+//! secret-key operation (see BurnReleasedStack() in pqc.cpp).
+constexpr size_t PQC_STACK_BURN_BYTES = 32 * 1024;
+
 /** Counts backend calls from CPQCPubKey::Verify for tests; production never
  * installs one. Invalid keys and signature lengths do not reach the backend.
  * Installation must not overlap another counter or any Verify call. Join all

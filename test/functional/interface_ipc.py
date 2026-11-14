@@ -9,7 +9,11 @@ from pathlib import Path
 import shutil
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (CBlock, CTransaction, ser_uint256, COIN)
-from test_framework.test_framework import (BitcoinTestFramework, assert_equal)
+from test_framework.test_framework import BitcoinTestFramework
+from test_framework.util import (
+    assert_equal,
+    assert_not_equal
+)
 from test_framework.wallet import MiniWallet
 
 # Test may be skipped and not have capnp installed
@@ -42,6 +46,7 @@ class IPCInterfaceTest(BitcoinTestFramework):
         # same file as capnp.load() loads directly below, and there are not
         # "failed: Duplicate ID @0xcc316e3f71a040fb" errors.
         imports = [str(mp_dir), str(capnp_dir), str(src_dir)]
+        self.capnp_imports = imports
         return {
             "proxy": capnp.load(str(mp_dir / "mp" / "proxy.capnp"), imports=imports),
             "init": capnp.load(str(src_dir / "ipc" / "capnp" / "init.capnp"), imports=imports),
@@ -50,10 +55,14 @@ class IPCInterfaceTest(BitcoinTestFramework):
         }
 
     def set_test_params(self):
-        self.num_nodes = 1
+        self.num_nodes = 2
+        # Do not trace IPC requests on the IPC node. Tracing reads every request
+        # field before the server method runs, which a default configuration
+        # does not do.
+        self.extra_args = [["-loglevel=ipc:debug"], []]
 
     def setup_nodes(self):
-        self.extra_init = [{"ipcbind": True}]
+        self.extra_init = [{"ipcbind": True}, {}]
         super().setup_nodes()
         # Use this function to also load the capnp modules (we cannot use set_test_params for this,
         # as it is being called before knowing whether capnp is available).
@@ -232,14 +241,78 @@ class IPCInterfaceTest(BitcoinTestFramework):
             assert_equal(res.reason, "bad-version(0x00000000)")
             res = await template.result.submitSolution(ctx, block.nVersion, block.nTime, block.nNonce, coinbase.serialize())
             assert_equal(res.result, False)
+
+            self.log.debug("Submit a missing coinbase")
+            template_block = (await template.result.getBlock(ctx)).result
+            res = await template.result.submitSolution(context=ctx, version=block.nVersion, timestamp=block.nTime, nonce=block.nNonce)
+            assert_equal(res.result, False)
+            self.log.debug("Submit an empty coinbase")
+            res = await template.result.submitSolution(ctx, block.nVersion, block.nTime, block.nNonce, b"")
+            assert_equal(res.result, False)
+            for desc, coinbase_data in [("one byte", b"\x01"), ("a truncated", coinbase.serialize()[:-1])]:
+                self.log.debug(f"Submit {desc} coinbase that cannot be deserialized")
+                with self.nodes[0].assert_debug_log(["Could not read transaction received over IPC"]):
+                    res = await template.result.submitSolution(ctx, block.nVersion, block.nTime, block.nNonce, coinbase_data)
+                assert_equal(res.result, False)
+            self.log.debug("Submit a coinbase field that is not Data")
+            # Load a copy of the mining schema, with the coinbase field declared
+            # as List(UInt64), into a separate parser and call the same template.
+            src_dir = Path(self.config['environment']['SRCDIR']) / "src"
+            alt_schema = (src_dir / "ipc" / "capnp" / "mining.capnp").read_text()
+            alt_schema = alt_schema.replace('import "common.capnp"', 'import "/ipc/capnp/common.capnp"')
+            alt_schema = alt_schema.replace("coinbase :Data", "coinbase :List(UInt64)")
+            assert "coinbase :List(UInt64)" in alt_schema
+            alt_schema_path = Path(self.options.tmpdir) / "mining_alt.capnp"
+            alt_schema_path.write_text(alt_schema)
+            parser = capnp.SchemaParser()
+            alt_proxy = parser.load(str(src_dir / "ipc" / "libmultiprocess" / "include" / "mp" / "proxy.capnp"), imports=self.capnp_imports)
+            alt_mining = parser.load(str(alt_schema_path), imports=self.capnp_imports)
+            alt_ctx = alt_proxy.Context()
+            alt_ctx.thread = ctx.thread.cast_as(alt_proxy.Thread)
+            request = template.result.cast_as(alt_mining.BlockTemplate).submitSolution_request()
+            request.context = alt_ctx
+            request.coinbase = [1]
+            with self.nodes[0].assert_debug_log(["Could not read transaction received over IPC"]):
+                res = await request.send()
+            assert_equal(res.result, False)
+            self.log.debug("The node keeps running and the template is unchanged")
+            assert_equal(self.nodes[0].getblockcount(), current_block_height)
+            assert_equal((await template.result.getBlock(ctx)).result, template_block)
+
             self.log.debug("Submit a valid block")
             block.nVersion = original_version
             block.solve()
+
+            self.log.debug("First call checkBlock()")
             res = await mining.result.checkBlock(block.serialize(), check_opts)
             assert_equal(res.result, True)
+
+            # The remote template block will be mutated, capture the original:
+            remote_block_before = await self.parse_and_deserialize_block(template, ctx)
+
+            self.log.debug("Submitted coinbase must include witness")
+            assert_not_equal(coinbase.serialize_without_witness().hex(), coinbase.serialize().hex())
+            res = await template.result.submitSolution(ctx, block.nVersion, block.nTime, block.nNonce, coinbase.serialize_without_witness())
+            assert_equal(res.result, False)
+
+            self.log.debug("Even a rejected submitBlock() mutates the template's block")
+            # Can be used by clients to download and inspect the (rejected)
+            # reconstructed block.
+            remote_block_after = await self.parse_and_deserialize_block(template, ctx)
+            assert_not_equal(remote_block_before.serialize().hex(), remote_block_after.serialize().hex())
+
+            self.log.debug("Submit again, with the witness")
             res = await template.result.submitSolution(ctx, block.nVersion, block.nTime, block.nNonce, coinbase.serialize())
             assert_equal(res.result, True)
+
+            self.log.debug("Block should propagate")
+            # Check that the IPC node actually updates its own chain
             assert_equal(self.nodes[0].getchaintips()[0]["height"], current_block_height + 1)
+            # Stalls if a regression causes submitBlock() to accept an invalid block:
+            self.sync_all()
+            # Check that the other node accepts the block
+            assert_equal(self.nodes[0].getchaintips()[0], self.nodes[1].getchaintips()[0])
+
             miniwallet.rescan_utxos()
             assert_equal(miniwallet.get_balance(), balance + 1)
             self.log.debug("Check block should fail now, since it is a duplicate")

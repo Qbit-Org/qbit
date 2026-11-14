@@ -2,10 +2,12 @@
 #include <clock.h>
 #include <log_rate_limiter.h>
 #include <protocol.h>
+#include <relay_engine.h>
 #include <test_harness.h>
 #include <udp_transport.h>
 #include <version.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -94,9 +96,14 @@ struct RpcState {
     std::size_t probe_calls{0};
     std::vector<std::string> getblock_hashes{};
     std::optional<std::vector<std::uint8_t>> getblock_result{std::vector<std::uint8_t>{0x01}};
-    bool submit_result{true};
+    photon::SubmitOutcome submit_result{photon::SubmitOutcome::kAccepted};
     std::size_t submit_calls{0};
     std::vector<std::uint8_t> last_submitted{};
+    photon::ParentCheck parent_result{photon::ParentCheck::kNearTip};
+    // Answers for the first parent checks, before parent_result applies.
+    std::deque<photon::ParentCheck> parent_results{};
+    std::size_t parent_check_calls{0};
+    std::string last_parent_hash{};
 };
 
 class ScriptedRpc final : public photon::app::Rpc {
@@ -118,11 +125,23 @@ public:
         return m_state->getblock_result;
     }
 
-    bool SubmitBlock(std::span<const std::uint8_t> block_data) override
+    photon::SubmitOutcome SubmitBlock(std::span<const std::uint8_t> block_data) override
     {
         ++m_state->submit_calls;
         m_state->last_submitted.assign(block_data.begin(), block_data.end());
         return m_state->submit_result;
+    }
+
+    photon::ParentCheck CheckParent(const std::string&, const std::string& prev_hash_hex, std::uint32_t) override
+    {
+        ++m_state->parent_check_calls;
+        m_state->last_parent_hash = prev_hash_hex;
+        if (!m_state->parent_results.empty()) {
+            const photon::ParentCheck result = m_state->parent_results.front();
+            m_state->parent_results.pop_front();
+            return result;
+        }
+        return m_state->parent_result;
     }
 
 private:
@@ -468,7 +487,10 @@ void TestHashNotificationSendsChunksToPeer()
     CHECK(SentMessage(transport_state->sent_packets, photon::MessageType::kBlockChunk));
 }
 
-void TestInboundChunksTriggerSubmitBlock()
+// Feeds a peer's block into the main loop, announced under this version's identifier or, with
+// `earlier_form`, under the form earlier versions use. With `first_check_unanswered`, qbitd does not
+// answer the first parent check and announces a block some loop iterations later.
+void RunInboundBlockThroughApp(bool first_check_unanswered, bool earlier_form)
 {
     ArgvBuilder args({"qbit-photon"});
     std::ostringstream out;
@@ -481,11 +503,30 @@ void TestInboundChunksTriggerSubmitBlock()
         15, 16, 17, 18, 19, 20, 21, 22,
     };
     constexpr std::uint16_t kPeerPort = 39002;
-    constexpr std::uint64_t kHashPrefix = 0x1122334455667788ULL;
+
+    // An 80-byte block header followed by a zero transaction count; the peer announces it under
+    // the identifier derived from its hash.
+    std::vector<std::uint8_t> block(81, 0);
+    for (std::size_t i = 0; i < 80; ++i) {
+        block[i] = static_cast<std::uint8_t>(i * 3 + 1);
+    }
+    const auto summary = photon::ReadBlockHeaderSummary(block);
+    CHECK(summary.has_value());
+    const std::string block_hash = summary.has_value() ? summary->hash_hex : std::string{};
+    const std::uint64_t kHashPrefix = earlier_form ? photon::HashPrefixFromHex(block_hash) : photon::BlockIdFromHex(block_hash);
 
     const auto listener_state = std::make_shared<ListenerState>();
     const auto rpc_state = std::make_shared<RpcState>();
     rpc_state->probe_result = true;
+    if (first_check_unanswered) {
+        rpc_state->parent_results.push_back(photon::ParentCheck::kUnavailable);
+        for (int i = 0; i < 20; ++i) {
+            listener_state->next_hash_results.push_back(std::nullopt);
+        }
+        std::array<std::uint8_t, 32> announced{};
+        announced.fill(0x42);
+        listener_state->next_hash_results.push_back(announced);
+    }
 
     const auto transport_state = std::make_shared<TransportState>();
 
@@ -503,7 +544,7 @@ void TestInboundChunksTriggerSubmitBlock()
 
     photon::BlockHeaderPayload header{};
     header.block_hash_prefix = kHashPrefix;
-    header.original_size = 5;
+    header.original_size = block.size();
     header.data_chunks = 2;
     header.coding_group_count = 1;
 
@@ -518,11 +559,7 @@ void TestInboundChunksTriggerSubmitBlock()
     chunk0.chunk_id = 0;
     chunk0.data_len = static_cast<std::uint16_t>(photon::kFecChunkSize);
     chunk0.chunk_data.fill(0);
-    chunk0.chunk_data[0] = 'h';
-    chunk0.chunk_data[1] = 'e';
-    chunk0.chunk_data[2] = 'l';
-    chunk0.chunk_data[3] = 'l';
-    chunk0.chunk_data[4] = 'o';
+    std::copy(block.begin(), block.end(), chunk0.chunk_data.begin());
 
     photon::Packet chunk0_packet = photon::MakePacket(photon::MessageType::kBlockChunk, 3);
     photon::EncodeBlockChunkPayload(chunk0, chunk0_packet.payload);
@@ -555,10 +592,25 @@ void TestInboundChunksTriggerSubmitBlock()
 
     const int rc = photon::app::Run(args.argc(), args.argv(), out, err, std::move(deps));
     CHECK(rc == 0);
+    CHECK(rpc_state->parent_check_calls == (first_check_unanswered ? 2U : 1U));
+    CHECK(summary.has_value() && rpc_state->last_parent_hash == summary->prev_hash_hex);
     CHECK(rpc_state->submit_calls == 1);
+    CHECK(rpc_state->last_submitted == block);
+    if (first_check_unanswered) {
+        // The block was tried again only after qbitd announced a block.
+        CHECK(rpc_state->getblock_hashes.size() == 1);
+    }
+}
 
-    const std::vector<std::uint8_t> expected{'h', 'e', 'l', 'l', 'o'};
-    CHECK(rpc_state->last_submitted == expected);
+void TestInboundChunksTriggerSubmitBlock()
+{
+    RunInboundBlockThroughApp(/*first_check_unanswered=*/false, /*earlier_form=*/false);
+    RunInboundBlockThroughApp(/*first_check_unanswered=*/false, /*earlier_form=*/true);
+}
+
+void TestUnansweredBlockRetriedByMainLoop()
+{
+    RunInboundBlockThroughApp(/*first_check_unanswered=*/true, /*earlier_form=*/false);
 }
 
 void TestMalformedUdpParseErrorsAreRateLimited()
@@ -606,6 +658,7 @@ int main()
     TestHashNotificationTriggersGetBlock();
     TestHashNotificationSendsChunksToPeer();
     TestInboundChunksTriggerSubmitBlock();
+    TestUnansweredBlockRetriedByMainLoop();
     TestMalformedUdpParseErrorsAreRateLimited();
     return photon::test::Finish();
 }

@@ -18,14 +18,30 @@ extern "C" {
 
 #include "libbitcoinpqc/sign_stats.h"
 
-/* Common error codes */
+/*
+ * Common error codes. The enum is append-only: existing values never change.
+ *
+ * - BAD_ARG: a NULL pointer, a NULL message with a nonzero size, too little
+ *   keygen random data, or a non-empty output struct.
+ * - BAD_KEY: key material of the wrong size, or a secret key whose stored
+ *   root does not match the root derived from its seeds (the check
+ *   bitcoin_pqc_secret_key_validate performs).
+ * - BAD_SIGNATURE: a signature of the wrong size, one that does not verify,
+ *   or a signing operation that failed for a reason other than the key or
+ *   the signing limit.
+ * - NOT_IMPLEMENTED: reserved; not returned by the single-profile library.
+ * - SIGNING_LIMIT: the bounded30 FORS+C or WOTS+C signing cap was exceeded.
+ * - OUT_OF_MEMORY: an internal allocation failed. The output struct is left
+ *   unchanged and no ownership is transferred.
+ */
 typedef enum {
     BITCOIN_PQC_OK = 0,
     BITCOIN_PQC_ERROR_BAD_ARG = -1,
     BITCOIN_PQC_ERROR_BAD_KEY = -2,
     BITCOIN_PQC_ERROR_BAD_SIGNATURE = -3,
     BITCOIN_PQC_ERROR_NOT_IMPLEMENTED = -4,
-    BITCOIN_PQC_ERROR_SIGNING_LIMIT = -5
+    BITCOIN_PQC_ERROR_SIGNING_LIMIT = -5,
+    BITCOIN_PQC_ERROR_OUT_OF_MEMORY = -6
 } bitcoin_pqc_error_t;
 
 /**
@@ -89,7 +105,12 @@ size_t bitcoin_pqc_signature_size(void);
  *                    into the internal 48-byte SLH-DSA seed with domain
  *                    separation and input-length binding.
  * @param random_data_size Size of random data, must be >= 128 bytes.
- * @return BITCOIN_PQC_OK on success, error code otherwise
+ * @return BITCOIN_PQC_OK on success, BITCOIN_PQC_ERROR_BAD_ARG for NULL
+ *         pointers, too little random data, or a non-empty output struct,
+ *         BITCOIN_PQC_ERROR_OUT_OF_MEMORY if the key buffers or the internal
+ *         seed-derivation buffer cannot be allocated, or
+ *         BITCOIN_PQC_ERROR_BAD_KEY if key generation fails for any other
+ *         reason.
  *
  * On success, public_key and secret_key are a self-consistent generated pair.
  * The generated secret key already contains the root computed during keygen, so
@@ -140,7 +161,14 @@ void bitcoin_pqc_keypair_free(bitcoin_pqc_keypair_t *keypair);
  * @param signature Pointer to a zero-initialized signature structure to
  *                  populate. Non-empty output structures are rejected without
  *                  being freed or overwritten.
- * @return BITCOIN_PQC_OK on success, error code otherwise
+ * @return BITCOIN_PQC_OK on success, BITCOIN_PQC_ERROR_BAD_ARG for NULL
+ *         pointers, a NULL non-empty message, or a non-empty output struct,
+ *         BITCOIN_PQC_ERROR_BAD_KEY for a wrong-size or inconsistent secret
+ *         key (the check bitcoin_pqc_secret_key_validate performs),
+ *         BITCOIN_PQC_ERROR_OUT_OF_MEMORY if the signature buffer cannot be
+ *         allocated, BITCOIN_PQC_ERROR_SIGNING_LIMIT if a signing cap is
+ *         exceeded, or BITCOIN_PQC_ERROR_BAD_SIGNATURE for any other signing
+ *         failure.
  */
 bitcoin_pqc_error_t bitcoin_pqc_sign(
     const uint8_t *secret_key,
@@ -161,8 +189,11 @@ bitcoin_pqc_error_t bitcoin_pqc_sign(
  *                  populate. Non-empty output structures are rejected without
  *                  being freed or overwritten.
  * @param stats Optional stats output. When non-NULL, zeroed and populated even
- *              when signing fails because a signing cap is exceeded.
- * @return BITCOIN_PQC_OK on success, error code otherwise
+ *              when signing fails because a signing cap is exceeded. Left
+ *              unchanged when the call fails before signing starts, such as
+ *              for a BAD_ARG, BAD_KEY, or OUT_OF_MEMORY result.
+ * @return BITCOIN_PQC_OK on success, otherwise the same error codes as
+ *         bitcoin_pqc_sign.
  */
 bitcoin_pqc_error_t bitcoin_pqc_sign_with_stats(
     const uint8_t *secret_key,

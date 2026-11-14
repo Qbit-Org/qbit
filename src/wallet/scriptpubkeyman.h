@@ -133,6 +133,14 @@ struct CryptedPQCKeyRecord
     std::optional<uint256> auth_tag;
 };
 
+//! A crypted record written in place of a plaintext PQC key record.
+struct ReencryptedPQCKey
+{
+    CPQCPubKey pubkey;
+    CryptedPQCKeyRecord record;
+    uint32_t sig_counter{0};
+};
+
 /*
  * A class implementing ScriptPubKeyMan manages some (or all) scriptPubKeys used in a wallet.
  * It contains the scripts and keys related to the scriptPubKeys it manages.
@@ -380,6 +388,11 @@ private:
     mutable CryptedPQCKeyMap m_map_crypted_pqc_keys GUARDED_BY(cs_desc_man);
     PQCKeyMap m_map_pqc_keys GUARDED_BY(cs_desc_man);
     PendingPlaintextPQCKeyMap m_pending_plaintext_pqc_keys GUARDED_BY(cs_desc_man);
+    //! Validated plaintext records found in an encrypted wallet. They are never
+    //! used to sign; ReencryptPlaintextPQCKeys replaces them with crypted records.
+    //! The counter is the plaintext record's. A key that also has a crypted
+    //! record keeps that record's counter in m_map_pqc_sig_counters.
+    PendingPlaintextPQCKeyMap m_unencrypted_pqc_keys GUARDED_BY(cs_desc_man);
     std::set<CPQCPubKey> m_failed_plaintext_pqc_keys GUARDED_BY(cs_desc_man);
     mutable std::map<CPQCPubKey, uint32_t> m_map_pqc_sig_counters GUARDED_BY(cs_desc_man);
 
@@ -393,6 +406,8 @@ private:
 
     bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey &pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool AddDescriptorPQCKeyWithDB(WalletBatch& batch, const CPQCPubKey& pubkey, const CPQCKey& key, bool has_encryption_keys = false, const CKeyingMaterial* encryption_key = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    bool HavePlaintextPQCKeyRecord(const CPQCPubKey& pubkey) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    bool HavePQCKeyRecord(const CPQCPubKey& pubkey) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool HasBlockedPlaintextPQCKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool IsPlaintextPQCKeyBlocked(const CPQCPubKey& pubkey) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     std::set<CPQCPubKey> GetBlockedPlaintextPQCKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
@@ -431,7 +446,10 @@ private:
         TopUpPublicationId publication_id{INVALID_TOPUP_PUBLICATION_ID};
     };
     void RollbackTopUp(const TopUpRollbackState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
-    TopUpPreparation PrepareTopUp(std::optional<bool> internal_hint) const;
+    //! Takes cs_wallet for the encryption key, so it runs before cs_desc_man.
+    TopUpPreparation PrepareTopUp(std::optional<bool> internal_hint) const LOCKS_EXCLUDED(cs_desc_man);
+    //! Fails if the wallet was encrypted after a plaintext snapshot was taken.
+    util::Result<void> CheckTopUpPreparation(const TopUpPreparation& prepared) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     util::Result<CTxDestination> GetNewDestinationNoNotify(OutputType type, int64_t* index, bool& notify) LOCKS_EXCLUDED(cs_desc_man);
     util::Result<void> TopUpWithInternalHintResultNoNotify(std::optional<bool> internal_hint, unsigned int size, bool& notify) LOCKS_EXCLUDED(cs_desc_man);
     void PublishTopUp(const TopUpChange& change);
@@ -444,6 +462,9 @@ private:
     unsigned int GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     KeyMap GetKeys() const;
+    //! Also returns the encryption state the keys were copied under and the
+    //! encryption key they were decrypted with, so that they agree.
+    KeyMap GetKeys(bool& has_encryption_keys, std::optional<CKeyingMaterial>& encryption_key) const;
 
     // Cached FlatSigningProviders to avoid regenerating them each time they are needed.
     mutable std::map<int32_t, FlatSigningProvider> m_map_signing_providers;
@@ -465,13 +486,25 @@ public:
     DescriptorScriptPubKeyMan(WalletStorage& storage, WalletDescriptor& descriptor, int64_t keypool_size);
     DescriptorScriptPubKeyMan(WalletStorage& storage, int64_t keypool_size);
 
+    //! Lock order: cs_wallet, then cs_desc_man, then the database writer.
+    //! Code holding cs_desc_man may take cs_wallet only if it already holds
+    //! it. Background top-ups hold cs_desc_man without cs_wallet while they
+    //! wait for the writer, so code with an open transaction must not wait
+    //! for an existing manager's cs_desc_man.
     mutable RecursiveMutex cs_desc_man;
+
+    // Optional deterministic test hook invoked by a self-committing top-up
+    // after it has taken its key snapshot and before it takes cs_desc_man.
+    // Configure it before starting concurrent wallet work and leave it
+    // unchanged until that work completes.
+    std::function<void()> m_after_prepare_top_up;
 
     util::Result<CTxDestination> GetNewDestination(const OutputType type) override;
     bool IsMine(const CScript& script) const override;
 
     bool CheckDecryptionKey(const CKeyingMaterial& master_key) override;
-    bool Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch) override;
+    //! The caller takes cs_desc_man before it begins the transaction.
+    bool Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch) override EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     util::Result<CTxDestination> GetReservedDestination(const OutputType type, bool internal, int64_t& index, bool allow_internal_p2mr_refill = true) override;
     void ReturnDestination(int64_t index, bool internal, const CTxDestination& addr) override;
@@ -549,6 +582,16 @@ public:
     bool CompletePendingPlaintextPQCKeyValidation(const CPQCPubKey& pubkey, const CPQCKey& key, uint32_t sig_counter);
     bool FailPendingPlaintextPQCKeyValidation(const CPQCPubKey& pubkey);
     std::vector<CPQCPubKey> GetPQCKeys() const;
+
+    //! Whether this encrypted wallet's manager holds validated plaintext PQC
+    //! records that WriteReencryptedPQCKeys can replace.
+    bool HasPQCKeysToReencrypt() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Writes a crypted record over each of those plaintext records. A key
+    //! that already has a crypted record keeps it at the higher of the two
+    //! counters. Changes nothing in memory: the caller applies the result with
+    //! ApplyReencryptedPQCKeys once its transaction has committed.
+    util::Result<std::vector<ReencryptedPQCKey>> WriteReencryptedPQCKeys(WalletBatch& batch, const CKeyingMaterial& master_key) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    void ApplyReencryptedPQCKeys(const std::vector<ReencryptedPQCKey>& keys) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     bool HasWalletDescriptor(const WalletDescriptor& desc) const;
     util::Result<void> UpdateWalletDescriptor(WalletDescriptor& descriptor);

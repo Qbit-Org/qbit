@@ -6,17 +6,81 @@
 #include <chainparams.h>
 #include <common/args.h>
 #include <logging.h>
+#include <sync.h>
 #include <util/fs.h>
 #include <wallet/db.h>
 
 #include <algorithm>
 #include <exception>
 #include <fstream>
+#include <map>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
 
+#ifndef WIN32
+#include <sys/stat.h>
+#endif
+
 namespace wallet {
+namespace {
+GlobalMutex g_sqlite_files_mutex;
+
+#ifndef WIN32
+using FileId = std::pair<uint64_t, uint64_t>;
+
+std::optional<FileId> GetFileId(const fs::path& path)
+{
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return std::nullopt;
+    return FileId{static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino)};
+}
+
+//! Number of SQLiteFileRegistration objects for each registered file.
+std::map<FileId, int> g_sqlite_files GUARDED_BY(g_sqlite_files_mutex);
+#endif
+
+bool IsRegisteredSQLiteFileLocked(const fs::path& path) EXCLUSIVE_LOCKS_REQUIRED(g_sqlite_files_mutex)
+{
+#ifndef WIN32
+    const auto id{GetFileId(path)};
+    return id && g_sqlite_files.contains(*id);
+#else
+    return false;
+#endif
+}
+} // namespace
+
+SQLiteFileRegistration::SQLiteFileRegistration(const fs::path& path)
+{
+#ifndef WIN32
+    m_id = GetFileId(path);
+    if (!m_id) {
+        throw std::runtime_error(strprintf("Unable to identify database file %s", fs::PathToString(path)));
+    }
+    LOCK(g_sqlite_files_mutex);
+    ++g_sqlite_files[*m_id];
+#endif
+}
+
+SQLiteFileRegistration::~SQLiteFileRegistration()
+{
+    if (!m_id) return;
+#ifndef WIN32
+    LOCK(g_sqlite_files_mutex);
+    auto it{g_sqlite_files.find(*m_id)};
+    assert(it != g_sqlite_files.end());
+    if (--it->second == 0) g_sqlite_files.erase(it);
+#endif
+}
+
+bool IsRegisteredSQLiteFile(const fs::path& path)
+{
+    LOCK(g_sqlite_files_mutex);
+    return IsRegisteredSQLiteFileLocked(path);
+}
+
 bool operator<(BytePrefix a, std::span<const std::byte> b) { return std::ranges::lexicographical_compare(a.prefix, b.subspan(0, std::min(a.prefix.size(), b.size()))); }
 bool operator<(std::span<const std::byte> a, BytePrefix b) { return std::ranges::lexicographical_compare(a.subspan(0, std::min(a.size(), b.prefix.size())), b.prefix); }
 
@@ -102,12 +166,21 @@ bool IsBDBFile(const fs::path& path)
     if (ec) LogWarning("Error reading file_size: %s [%s]", ec.message(), fs::PathToString(path));
     if (size < 4096) return false;
 
-    std::ifstream file{path, std::ios::binary};
-    if (!file.is_open()) return false;
-
-    file.seekg(12, std::ios::beg); // Magic bytes start at offset 12
     uint32_t data = 0;
-    file.read((char*) &data, sizeof(data)); // Read 4 bytes of file to compare against magic
+    {
+        // Closing the file would release this process's lock on a loaded
+        // SQLite wallet. Hold the mutex until the file is closed, so that a
+        // wallet loading on another thread is either registered before the
+        // check or takes its lock after the close.
+        LOCK(g_sqlite_files_mutex);
+        if (IsRegisteredSQLiteFileLocked(path)) return false;
+
+        std::ifstream file{path, std::ios::binary};
+        if (!file.is_open()) return false;
+
+        file.seekg(12, std::ios::beg); // Magic bytes start at offset 12
+        file.read((char*) &data, sizeof(data)); // Read 4 bytes of file to compare against magic
+    }
 
     // Berkeley DB Btree magic bytes, from:
     //  https://github.com/file/file/blob/5824af38469ec1ca9ac3ffd251e7afe9dc11e227/magic/Magdir/database#L74-L75
@@ -126,19 +199,25 @@ bool IsSQLiteFile(const fs::path& path)
     if (ec) LogWarning("Error reading file_size: %s [%s]", ec.message(), fs::PathToString(path));
     if (size < 512) return false;
 
-    std::ifstream file{path, std::ios::binary};
-    if (!file.is_open()) return false;
-
-    // Magic is at beginning and is 16 bytes long
     char magic[16];
-    file.read(magic, 16);
-
-    // Application id is at offset 68 and 4 bytes long
-    file.seekg(68, std::ios::beg);
     char app_id[4];
-    file.read(app_id, 4);
+    {
+        // Hold the mutex until the file is closed, see IsBDBFile().
+        LOCK(g_sqlite_files_mutex);
+        if (IsRegisteredSQLiteFileLocked(path)) return true;
 
-    file.close();
+        std::ifstream file{path, std::ios::binary};
+        if (!file.is_open()) return false;
+
+        // Magic is at beginning and is 16 bytes long
+        file.read(magic, 16);
+
+        // Application id is at offset 68 and 4 bytes long
+        file.seekg(68, std::ios::beg);
+        file.read(app_id, 4);
+
+        file.close();
+    }
 
     // Check the magic, see https://sqlite.org/fileformat.html
     std::string magic_str(magic, 16);

@@ -167,6 +167,9 @@ void StartWallets(WalletContext& context)
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets(context)) {
         pwallet->postInitProcess();
         SchedulePlaintextPQCKeyValidation(*Assert(context.scheduler), pwallet);
+        // Resume a deferred top-up that an earlier shutdown interrupted, as
+        // loadwallet does. LoadWallets() runs before the scheduler is set.
+        MaybeSchedulePendingInitialKeyPoolTopUpAfterLoad(context, pwallet);
     }
 
     context.scheduler->scheduleEvery([&context] { MaybeResendWalletTxs(context); }, 1min);

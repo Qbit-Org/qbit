@@ -19,6 +19,17 @@ const OK: i32 = 0;
 const BAD_ARG: i32 = -1;
 const BAD_KEY: i32 = -2;
 const BAD_SIGNATURE: i32 = -3;
+const OUT_OF_MEMORY: i32 = -6;
+
+/// Keygen hashes the entropy through a heap buffer that grows with the entropy
+/// size. A length this close to `usize::MAX` passes the overflow check but
+/// asks `malloc` for more than `PTRDIFF_MAX` bytes, which every supported
+/// allocator refuses before the entropy is read, so no out-of-bounds access
+/// can occur. A C library instrumented with AddressSanitizer aborts on such a
+/// request unless `ASAN_OPTIONS=allocator_may_return_null=1` is set, so the
+/// release-checklist ASan smoke sets it; CI does not run `cargo test` under
+/// ASan.
+const UNSATISFIABLE_ENTROPY_SIZE: usize = usize::MAX - 1024;
 
 #[link(name = "bitcoinpqc", kind = "static")]
 unsafe extern "C" {
@@ -189,6 +200,42 @@ fn c_api_rejects_invalid_key_and_signature_sizes() {
         );
 
         bitcoin_pqc_signature_free(&mut signature);
+        bitcoin_pqc_keypair_free(&mut keypair);
+    }
+}
+
+#[test]
+fn c_api_sign_reports_inconsistent_secret_key_as_bad_key() {
+    unsafe {
+        let mut keypair = generate_test_keypair();
+        let message = b"c api inconsistent secret key";
+        let secret_key =
+            std::slice::from_raw_parts(keypair.secret_key as *const u8, keypair.secret_key_size)
+                .to_vec();
+        let n = keypair.secret_key_size / 4;
+
+        // Layout: [SK_SEED || SK_PRF || PUB_SEED || root]. Every part the
+        // stored root depends on must be reported as a rejected key, not as a
+        // failed signing operation, and the output struct must stay empty.
+        for offset in [0, 2 * n, 3 * n] {
+            let mut corrupted = secret_key.clone();
+            corrupted[offset] ^= 0x80;
+            let mut rejected_signature = empty_signature();
+            assert_eq!(
+                bitcoin_pqc_sign(
+                    corrupted.as_ptr(),
+                    corrupted.len(),
+                    message.as_ptr(),
+                    message.len(),
+                    &mut rejected_signature,
+                ),
+                BAD_KEY,
+                "mutation at byte {offset} should be reported as BAD_KEY"
+            );
+            assert!(rejected_signature.signature.is_null());
+            assert_eq!(rejected_signature.signature_size, 0);
+        }
+
         bitcoin_pqc_keypair_free(&mut keypair);
     }
 }
@@ -443,5 +490,22 @@ fn c_api_rejects_reused_or_nonzero_output_structs() {
 
         bitcoin_pqc_signature_free(&mut signature);
         bitcoin_pqc_keypair_free(&mut keypair);
+    }
+}
+
+#[test]
+fn c_api_keygen_reports_failed_allocation_as_out_of_memory() {
+    unsafe {
+        let entropy = fixed_entropy();
+        let mut keypair = empty_keypair();
+
+        assert_eq!(
+            bitcoin_pqc_keygen(&mut keypair, entropy.as_ptr(), UNSATISFIABLE_ENTROPY_SIZE),
+            OUT_OF_MEMORY
+        );
+        assert!(keypair.public_key.is_null());
+        assert!(keypair.secret_key.is_null());
+        assert_eq!(keypair.public_key_size, 0);
+        assert_eq!(keypair.secret_key_size, 0);
     }
 }

@@ -90,13 +90,31 @@ the special compile option is platform-specific.
 When `BITCOINPQC_ENABLE_TEST_HELPERS=ON` is set directly in CMake, or the Cargo
 feature `test-helpers` is enabled, `src/test_helpers.c` is appended to
 `BITCOINPQC_SOURCES` and `BITCOINPQC_ENABLE_TEST_HELPERS=1` is defined. This is
-test-only support and is not part of the default library build.
+test-only support and is not part of the default library build. It includes
+private wrappers for passive SHA-256 and SHA-512 dispatcher introspection. The
+wrappers report the implementation already cached by each dispatcher and do
+not initialize it. They are not declared in the installed C headers and are
+not part of the public Rust API.
 
 When `SPX_ENABLE_TEST_BENCH_ENV_KNOBS=ON` is set directly in CMake, or the Cargo
 feature `test-bench-env-knobs` is enabled, the C target defines
 `SPX_ENABLE_TEST_BENCH_ENV_KNOBS=1` instead of `SPX_PRODUCTION_BUILD=1`. This is
 test/benchmark-only support for backend experiments; production builds ignore
 the runtime knobs documented in `docs/runtime-crypto-env.md`.
+
+The backend differential target needs both independent options: env knobs to
+request a backend and test helpers to observe the effective backend. Use:
+
+```bash
+cargo test --features test-bench-env-knobs,test-helpers \
+  --test backend_differential_tests -- --nocapture
+```
+
+The target explicitly probes SHA-512 because the active profile defines
+`SPX_SHA512=0`; signing and verification use only SHA-256, and only key
+generation's seed derivation initializes the SHA-512 dispatcher. Default production builds
+compile neither the env controls nor the introspection wrappers, so their
+compiled API and dispatcher behavior are unchanged.
 
 ## Removed Non-Production Code
 

@@ -32,7 +32,10 @@ public:
 
     virtual bool Probe() = 0;
     virtual std::optional<std::vector<std::uint8_t>> GetBlock(const std::string& hash_hex) = 0;
-    virtual bool SubmitBlock(std::span<const std::uint8_t> block_data) = 0;
+    virtual SubmitOutcome SubmitBlock(std::span<const std::uint8_t> block_data) = 0;
+    virtual ParentCheck CheckParent(const std::string& block_hash_hex,
+                                    const std::string& prev_hash_hex,
+                                    std::uint32_t max_depth) = 0;
 };
 
 class Transport {

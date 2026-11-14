@@ -132,6 +132,15 @@ fails if a seed that depends on a value found by search no longer reaches its
 path: the transport key that begins like a v1 message, and the ML-KEM key
 whose matrix needs an extra block.
 
+The coverage checks count executions at source lines named in its `ANCHORS`
+table. Core Checks runs `test/fuzz/test_qbit_fuzz_coverage.py --anchors-only`,
+which needs no build. It fails when an anchored line's text changes, or when
+the line is removed or duplicated; it does not check what the line now counts.
+If you change an anchored line in `src/crypto/pqc.cpp`, `src/crypto/pqc.h`,
+`src/script/interpreter.cpp`, `src/script/sign.cpp` or the qbit fuzz harnesses
+(`src/test/fuzz/p2mr_script.cpp`, `src/test/fuzz/pqc.cpp`), update its anchor so
+that it still counts the same check.
+
 ## Overview of Bitcoin Core fuzzing
 
 [Google](https://github.com/google/fuzzing/) has a good overview of fuzzing in general, with contributions from key architects of some of the most-used fuzzers. [This paper](https://agroce.github.io/bitcoin_report.pdf) includes an external overview of the status of Bitcoin Core fuzzing, as of summer 2021.  [John Regehr](https://blog.regehr.org/archives/1687) provides good advice on writing code that assists fuzzers in finding bugs, which is useful for developers to keep in mind.

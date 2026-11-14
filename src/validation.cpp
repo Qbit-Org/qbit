@@ -3474,12 +3474,19 @@ bool Chainstate::ConnectTip(
              Ticks<MillisecondsDouble>(time_2 - time_1));
     {
         CCoinsViewCache view(&CoinsTip());
-        bool rv = ConnectBlock(*block_to_connect, state, pindexNew, view);
+        // Recovered blocks have not been through AcceptBlock; check them as
+        // other received blocks are checked.
+        bool rv = !used_recovered || CheckBlock(*block_to_connect, state, m_chainman.GetConsensus());
+        if (rv) rv = ConnectBlock(*block_to_connect, state, pindexNew, view);
         if (!rv) {
             if (used_recovered) {
                 m_chainman.ClearWitnessRecovery(pindexNew->GetBlockHash());
                 (void)m_blockman.RemoveRecoveredBlock(pindexNew->GetBlockHash());
-                if (state.IsInvalid()) {
+                // Retry recovery only if the copy itself is bad. A copy that
+                // passes CheckRecoveredBlock() has the data the block hash
+                // commits to, so its failure is the block's own.
+                BlockValidationState copy_state;
+                if (state.IsInvalid() && !m_chainman.CheckRecoveredBlock(*block_to_connect, *pindexNew, copy_state)) {
                     LogWarning("Recovered witness block %s failed validation (%s); discarding recovered payload and retrying recovery\n",
                                pindexNew->GetBlockHash().ToString(), state.ToString());
                     BlockValidationState retry_state;
@@ -4438,10 +4445,23 @@ static bool CheckWitnessMalleation(const CBlock& block, bool expect_witness_comm
     return true;
 }
 
+/** Result for a block size or weight over the limit. The AuxPoW is not
+ *  committed by the block hash and another copy may carry a smaller one, so
+ *  the failure is a consensus failure only if the rest of the block exceeds
+ *  the limit on its own. */
+static BlockValidationResult SizeLimitResult(const CBlock& block, uint64_t cost)
+{
+    // Only a serialized AuxPoW counts toward the size.
+    if (!block.SignalsAuxpow() || !block.HasAuxpow()) return BlockValidationResult::BLOCK_CONSENSUS;
+    const uint64_t auxpow_cost{::GetSerializeSize(*block.auxpow) * WITNESS_SCALE_FACTOR};
+    return cost - auxpow_cost > MAX_BLOCK_WEIGHT ? BlockValidationResult::BLOCK_CONSENSUS : BlockValidationResult::BLOCK_MUTATED;
+}
+
 static bool CheckBlockWeight(const CBlock& block, BlockValidationState& state, const char* check_name)
 {
-    if (GetBlockWeight(block) > MAX_BLOCK_WEIGHT) {
-        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-weight", strprintf("%s : weight limit failed", check_name));
+    const int64_t weight{GetBlockWeight(block)};
+    if (weight > MAX_BLOCK_WEIGHT) {
+        return state.Invalid(SizeLimitResult(block, weight), "bad-blk-weight", strprintf("%s : weight limit failed", check_name));
     }
     return true;
 }
@@ -4475,8 +4495,11 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
     // checks that use witness data may be performed here.
 
     // Size limits
-    if (block.vtx.empty() || block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT || ::GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT)
+    if (block.vtx.empty() || block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT)
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-length", "size limits failed");
+    if (const uint64_t stripped_cost{::GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR}; stripped_cost > MAX_BLOCK_WEIGHT) {
+        return state.Invalid(SizeLimitResult(block, stripped_cost), "bad-blk-length", "size limits failed");
+    }
 
     // First transaction must be coinbase, the rest must not be
     if (block.vtx.empty() || !block.vtx[0]->IsCoinBase())
@@ -4751,7 +4774,8 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     // coinbase witness, it would be possible for the weight to be too
     // large by filling up the coinbase witness, which doesn't change
     // the block hash, so we couldn't mark the block as permanently
-    // failed).
+    // failed). AuxPoW remains uncommitted even after this check, so the weight
+    // helper classifies failures using the size of the committed portion.
     if (!CheckBlockWeight(block, state, __func__)) return false;
 
     return true;
@@ -4983,6 +5007,7 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
 {
     AssertLockNotHeld(cs_main);
 
+    bool stored_block{false};
     {
         CBlockIndex *pindex = nullptr;
         if (new_block) *new_block = false;
@@ -5000,8 +5025,9 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
         bool ret = CheckBlock(*block, state, GetConsensus());
         if (ret) {
             // Store to disk
-            ret = AcceptBlock(block, state, &pindex, force_processing, nullptr, new_block, min_pow_checked, requested_stripped);
+            ret = AcceptBlock(block, state, &pindex, force_processing, nullptr, &stored_block, min_pow_checked, requested_stripped);
         }
+        if (new_block) *new_block = stored_block;
         if (!ret) {
             if (m_options.signals) {
                 m_options.signals->BlockChecked(block, state);
@@ -5013,15 +5039,19 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
 
     NotifyHeaderTip();
 
+    // AuxPoW is not committed by the block hash, so a copy that AcceptBlock did
+    // not validate and store may differ from the stored block with this hash.
+    // Only hand ActivateBestChain the copy that was validated and stored.
+    const std::shared_ptr<const CBlock> connect_block{stored_block ? block : nullptr};
     BlockValidationState state; // Only used to report errors, not invalidity - ignore it
-    if (!ActiveChainstate().ActivateBestChain(state, block)) {
+    if (!ActiveChainstate().ActivateBestChain(state, connect_block)) {
         LogError("%s: ActivateBestChain failed (%s)\n", __func__, state.ToString());
         return false;
     }
 
     Chainstate* bg_chain{WITH_LOCK(cs_main, return BackgroundSyncInProgress() ? m_ibd_chainstate.get() : nullptr)};
     BlockValidationState bg_state;
-    if (bg_chain && !bg_chain->ActivateBestChain(bg_state, block)) {
+    if (bg_chain && !bg_chain->ActivateBestChain(bg_state, connect_block)) {
         LogError("%s: [background] ActivateBestChain failed (%s)\n", __func__, bg_state.ToString());
         return false;
      }
@@ -5088,6 +5118,19 @@ void ChainstateManager::ClearWitnessRecovery(const uint256& block_hash)
     if (m_pending_witness_recovery == block_hash) {
         m_pending_witness_recovery.reset();
     }
+}
+
+bool ChainstateManager::CheckRecoveredBlock(const CBlock& block, const CBlockIndex& block_index, BlockValidationState& state) const
+{
+    AssertLockHeld(::cs_main);
+
+    // As in AcceptBlockHeader() for a known header, check the payload against
+    // the commitment rules for the block's height.
+    if (const auto error = auxpow::Validate(block, GetConsensus(), /*check_pow=*/true, auxpow::CommitmentValidationForHeight(GetConsensus(), block_index.nHeight))) {
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, error->reject_reason, error->debug_message);
+    }
+    return CheckBlock(block, state, GetConsensus()) &&
+           ContextualCheckBlock(block, state, *this, block_index.pprev);
 }
 
 MempoolAcceptResult ChainstateManager::ProcessTransaction(const CTransactionRef& tx, bool test_accept)

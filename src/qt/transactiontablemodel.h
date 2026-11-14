@@ -80,8 +80,8 @@ public:
     QModelIndex index(int row, int column, const QModelIndex & parent = QModelIndex()) const override;
     bool processingQueuedTransactions() const { return fProcessingQueuedTransactions; }
     /** Replay, in arrival order, the updates held back while the wallet was
-        being encrypted. Called by the wallet model once its encryption
-        worker has released the wallet. */
+        being encrypted. Called by the wallet model once the encryption has
+        released the wallet, whoever started it. */
     void deliverDeferredUpdates();
 
 private:
@@ -93,7 +93,7 @@ private:
     bool fProcessingQueuedTransactions{false};
     /** Transaction updates and balloon-limit changes received from the event
         loop while the wallet was being encrypted. Applying an update reads
-        the wallet, which blocks while the encryption worker holds its locks,
+        the wallet, which blocks while the encryption holds its locks,
         so they wait here for deliverDeferredUpdates(). */
     std::vector<std::function<void()>> m_deferred_updates;
     const PlatformStyle *platformStyle;

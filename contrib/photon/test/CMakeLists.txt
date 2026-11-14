@@ -109,6 +109,10 @@ add_test(
 )
 
 add_executable(photon_relay_engine_tests relay_engine_tests.cpp)
+target_include_directories(photon_relay_engine_tests
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
 target_link_libraries(photon_relay_engine_tests
     PRIVATE
         photon_core

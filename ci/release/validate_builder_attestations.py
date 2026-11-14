@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import validate_key_metadata as key_metadata
 from validate_key_metadata import MetadataError, validate_operator_policy
 
 
@@ -378,15 +379,19 @@ def import_operator_keys(
             )
 
     result = run_command(
-        [gpg, "--batch", "--homedir", str(gnupg_home), "--with-colons", "--fingerprint", "--list-keys"]
+        [gpg, "--batch", "--homedir", str(gnupg_home), "--with-colons", "--fingerprint", "--list-keys"],
+        text=False,
     )
     if result.returncode != 0:
-        raise BuilderValidationError(f"Failed to list imported builder keys:\n{result.stderr}")
+        raise BuilderValidationError(f"Failed to list imported builder keys:\n{key_metadata.shown(result.stderr)}")
 
     imported: set[str] = set()
-    for line in result.stdout.splitlines():
-        fields = line.split(":")
-        if fields and fields[0] == "fpr" and len(fields) > 9:
+    try:
+        records = key_metadata.colon_records(result.stdout, "gpg's listing of the imported builder keys")
+    except key_metadata.GpgOutputError as exc:
+        raise BuilderValidationError(str(exc)) from exc
+    for fields in records:
+        if fields[0] == "fpr" and len(fields) > 9:
             imported.add(normalize_fingerprint(fields[9]))
 
     expected = {builder.fingerprint for builder in policy.active_builders.values()}
@@ -403,14 +408,18 @@ def run_command(
     *,
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
-) -> subprocess.CompletedProcess[str]:
+    text: bool = True,
+) -> subprocess.CompletedProcess[Any]:
+    """Run `command`. Output that gets parsed is read as bytes (text=False): text
+    mode would also turn a carriage return into a line feed."""
+
     return subprocess.run(
         command,
         check=False,
         capture_output=True,
         cwd=cwd,
         env=env,
-        text=True,
+        text=text,
     )
 
 
@@ -423,16 +432,20 @@ def release_version(tag: str) -> str:
     return version
 
 
-def git_stdout(git: str, source_root: Path, args: list[str], *, action: str) -> str:
+def git_bytes(git: str, source_root: Path, args: list[str], *, action: str) -> bytes:
     try:
-        result = run_command([git, "-C", str(source_root), *args])
+        result = run_command([git, "-C", str(source_root), *args], text=False)
     except OSError as exc:
         raise BuilderValidationError(f"Failed to run git while {action}: {exc}") from exc
     if result.returncode != 0:
-        detail = one_line_error(Exception(result.stderr or result.stdout))
+        detail = one_line_error(Exception(key_metadata.shown(result.stderr or result.stdout)))
         suffix = f": {detail}" if detail else ""
         raise BuilderValidationError(f"Failed to {action}{suffix}")
-    return result.stdout.strip()
+    return result.stdout
+
+
+def git_stdout(git: str, source_root: Path, args: list[str], *, action: str) -> str:
+    return key_metadata.shown(git_bytes(git, source_root, args, action=action)).strip()
 
 
 def reconstruct_canonical_source_archive(
@@ -463,21 +476,26 @@ def reconstruct_canonical_source_archive(
             f"Release tag {tag} must be an annotated tag object, got {object_type!r}"
         )
 
-    tag_payload = git_stdout(
+    tag_payload = git_bytes(
         git,
         source_root,
-        ["cat-file", "-p", tag_ref],
+        ["cat-file", "tag", tag_ref],
         action=f"inspect annotated release tag {tag}",
     )
-    tag_headers = tag_payload.split("\n\n", 1)[0].splitlines()
+    # Bytes, so that only a line feed ends a header line: the tagger line
+    # after these holds whatever name and email the tagger chose.
+    tag_headers = tag_payload.split(b"\n\n", 1)[0].split(b"\n")
     if (
         len(tag_headers) < 2
-        or not tag_headers[0].startswith("object ")
-        or not tag_headers[1].startswith("type ")
+        or not tag_headers[0].startswith(b"object ")
+        or not tag_headers[1].startswith(b"type ")
     ):
         raise BuilderValidationError(f"Release tag {tag} has malformed object headers")
-    direct_target = tag_headers[0].removeprefix("object ").lower()
-    direct_target_type = tag_headers[1].removeprefix("type ")
+    try:
+        direct_target = tag_headers[0].removeprefix(b"object ").decode("ascii").lower()
+        direct_target_type = tag_headers[1].removeprefix(b"type ").decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise BuilderValidationError(f"Release tag {tag} has malformed object headers") from exc
     if direct_target_type != "commit":
         raise BuilderValidationError(
             f"Release tag {tag} must directly target a commit, got {direct_target_type!r}"
@@ -543,15 +561,13 @@ def reconstruct_canonical_source_archive(
     )
 
 
-def status_fingerprints(status_output: str) -> list[str]:
-    fingerprints: list[str] = []
-    for line in status_output.splitlines():
-        if not line.startswith("[GNUPG:] VALIDSIG "):
-            continue
-        fields = line.split()
-        if len(fields) >= 3:
-            fingerprints.append(normalize_fingerprint(fields[2]))
-    return fingerprints
+def good_signatures(status_output: bytes, what: str) -> list[tuple[str, str]]:
+    """validate_key_metadata.good_signatures, refusing what it cannot read as a builder validation error."""
+
+    try:
+        return key_metadata.good_signatures(status_output)
+    except MetadataError as exc:
+        raise BuilderValidationError(f"{what}: {exc}") from exc
 
 
 def verify_manifest_signature(
@@ -559,7 +575,9 @@ def verify_manifest_signature(
     gnupg_home: Path,
     manifest: Path,
     expected_fingerprint: str,
-) -> None:
+) -> str:
+    """Verify a builder attestation and return its primary-key fingerprint."""
+
     signature = Path(f"{manifest}.asc")
     if not signature.is_file():
         raise BuilderValidationError(f"Missing builder attestation signature: {signature}")
@@ -577,11 +595,15 @@ def verify_manifest_signature(
             "--verify",
             str(signature),
             str(manifest),
-        ]
+        ],
+        text=False,
     )
     if result.returncode != 0:
-        raise BuilderValidationError(f"Builder attestation signature failed: {signature}\n{result.stderr}")
-    valid_fingerprints = set(status_fingerprints(result.stdout))
+        raise BuilderValidationError(
+            f"Builder attestation signature failed: {signature}\n{key_metadata.shown(result.stderr)}"
+        )
+    good = good_signatures(result.stdout, f"Builder attestation {signature}")
+    valid_fingerprints = {signing for signing, _primary in good}
     unexpected = sorted(valid_fingerprints - {expected_fingerprint})
     if unexpected:
         raise BuilderValidationError(
@@ -592,6 +614,10 @@ def verify_manifest_signature(
         raise BuilderValidationError(
             f"Builder attestation {signature} was not signed by expected fingerprint {expected_fingerprint}"
         )
+    primaries = {primary for _signing, primary in good}
+    if len(primaries) != 1:
+        raise BuilderValidationError(f"Builder attestation {signature} did not name exactly one primary key")
+    return primaries.pop()
 
 
 def find_builder_manifest(builder_dir: Path, artifact: str) -> Path | None:
@@ -643,7 +669,10 @@ def validate_artifact_attestations(
     builders: dict[str, BuilderOperator],
     quorum: int,
 ) -> list[str]:
+    # Quorum counts distinct primary keys: builders whose signing keys share
+    # one primary key count once.
     counted: list[str] = []
+    counted_primaries: dict[str, str] = {}
     rejected: list[str] = []
     version_dir = guix_sigs_repo / version
     if not version_dir.is_dir():
@@ -659,8 +688,12 @@ def validate_artifact_attestations(
         if manifest is None:
             continue
         try:
-            verify_manifest_signature(gpg, gnupg_home, manifest, builder.fingerprint)
+            primary = verify_manifest_signature(gpg, gnupg_home, manifest, builder.fingerprint)
             require_manifest_coverage(manifest, release_entries, source_archive)
+            if primary in counted_primaries:
+                rejected.append(f"{alias}: primary key {primary} already counted for {counted_primaries[primary]}")
+                continue
+            counted_primaries[primary] = alias
             counted.append(alias)
         except BuilderValidationError as exc:
             rejected.append(f"{alias}: {one_line_error(exc)}")
