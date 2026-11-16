@@ -273,6 +273,8 @@ class BIP68Test(BitcoinTestFramework):
         self.nodes[0].prioritisetransaction(txid=tx2.txid_hex, fee_delta=int(-self.relayfee*COIN))
         cur_time = int(time.time())
         for _ in range(10):
+            # A 600 s jump with a block still in flight trips the block download timeout.
+            self.sync_blocks()
             for node in self.nodes:
                 node.setmocktime(cur_time + 600)
             self.generate(self.wallet, 1, sync_fun=self.no_op)
@@ -287,6 +289,8 @@ class BIP68Test(BitcoinTestFramework):
         self.nodes[0].prioritisetransaction(txid=tx2.txid_hex, fee_delta=int(self.relayfee*COIN))
 
         # Advance the time on the node so that we can test timelocks
+        # A 600 s jump with a block still in flight trips the block download timeout.
+        self.sync_blocks()
         for node in self.nodes:
             node.setmocktime(cur_time + 600)
         # Save block template now to use for the reorg later
