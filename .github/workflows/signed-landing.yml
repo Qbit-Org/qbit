@@ -15,6 +15,12 @@
 # branch that doesn't exist yet, and a branch can be created at any commit
 # already in the repository. A fork's branch never merges as it is.
 #
+# Before naming a branch in AS_IS_LINES: the check reads the branch's rules as
+# they are now. It can't see who may bypass them, and it doesn't judge what
+# the branch already held when the rules were added. So name a branch only
+# when no ruleset on it lets anyone push to it, create it or delete it outside
+# a pull request, and when its history is accepted as it stands.
+#
 # It always runs from the default branch's copy of this file
 # (pull_request_target), whatever branch the pull request targets, so a pull
 # request can't change the rule it is judged by. It reads the pull request
@@ -242,7 +248,8 @@ jobs:
               passed, and can't be created, or deleted and made again, at another commit: as sentences, none when they
               lack nothing. `rules` is GitHub's answer for the branch, all pages of it. GitHub answers for a branch that
               doesn't exist too, and anyone who can push can create a branch at any commit already in the repository,
-              unless a rule restricts who can create it."""
+              unless a rule restricts who can create it. The answer doesn't say who may bypass a rule, so the rules bind
+              only those they don't exempt: the workflow's header says when a branch may be listed."""
               if not isinstance(rules, list) or not all(isinstance(rule, dict) and isinstance(rule.get("type"), str)
                                                         for rule in rules):
                   raise Unknown("GitHub's list of the rules for the pull request's branch has an unexpected shape")
@@ -277,10 +284,11 @@ jobs:
               """judge() for a branch of this repository that merges as it is (`listed`: one of AS_IS_LINES).
 
               A listed line passes when GitHub's rules for it require this check on every pull request into it and
-              restrict who can create, delete or force-push it: it gains commits only through pull requests this check
-              passed, and nobody can make it, or make it again, at another commit. Otherwise its head commit, read by itself, has to be signed
-              by a person, as for a branch matching AS_IS_HEADS: the signature covers the commit's tree and parents, so
-              the person who signed it answers for everything it brings, however many commits that is."""
+              restrict who can create, delete or force-push it: from then on it gains commits only through pull requests
+              this check passed, and nobody the rules bind can make it, or make it again, at another commit. What it held
+              before the rules is not judged. Otherwise its head commit, read by itself, has to be signed by a person, as
+              for a branch matching AS_IS_HEADS: the signature covers the commit's tree and parents, so the person who
+              signed it answers for everything it brings, however many commits that is."""
               gaps = line_gaps(line_rules(head_ref)) if listed else []
               if listed and not gaps:
                   return (f"`{head_ref}` merges as it is: GitHub's rules for it require this check on every pull request into "
