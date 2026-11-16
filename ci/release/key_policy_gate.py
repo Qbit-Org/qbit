@@ -11,9 +11,11 @@ policy  checks contrib/keys/operator-keys at --head against --base: both trees
 target  is the base-only job (pull_request_target): run from a checkout of the
         base, it requires --head to contain --base, finds the paths --head
         changes against --base, runs `policy` for a policy change, and
-        requires approvals for a change to the gate's own code (see
-        is_gate_code: every file under GATE_CODE_PREFIXES, GATE_CODE_PATHS,
-        and every .gitattributes).
+        requires approvals for a change to the gate's own code
+        (GATE_CODE_PATHS: its workflow, this script and the validator it
+        loads). Without approvals, it checks every workflow when one changes,
+        and the gate's files against the attribute files when one of those
+        changes.
 
 Nothing from --head is executed or imported: its files are written out as data
 for the validators and gpg to read.
@@ -85,7 +87,7 @@ import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 import unicodedata  # noqa: E402
 import traceback  # noqa: E402
-from pathlib import Path  # noqa: E402
+from pathlib import Path, PurePosixPath  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 
@@ -116,10 +118,12 @@ def load_module(name: str, path: Path):
     return module
 
 
-classify_merge_profile = load_module("classify_merge_profile", HERE.parent / "checks" / "classify_merge_profile.py")
+# The one module the gate loads: with the workflow and this script, all of the
+# gate's code (GATE_CODE_PATHS).
 key_metadata = load_module("validate_key_metadata", HERE / "validate_key_metadata.py")
 
 POLICY_DIR = "contrib/keys/operator-keys"
+POLICY_FILE = f"{POLICY_DIR}/keys.json"
 GATE_APPROVALS_DIR = "contrib/keys/gate-approvals"
 GATE_CHECK_NAME = "Key Policy Gate"
 # The base branches the gate checks, each under its own check name, which that
@@ -149,14 +153,19 @@ GATE_STEP_ENV = {
     "REPOSITORY_URL": "${{ github.server_url }}/${{ github.repository }}",
 }
 GATE_WORKFLOW = ".github/workflows/key-policy-gate.yml"
+GATE_SCRIPT = "ci/release/key_policy_gate.py"
+GATE_VALIDATOR = "ci/release/validate_key_metadata.py"
 WORKFLOW_DIR = ".github/workflows/"
-# The gate's own code and its description: a change to any file under these
-# directories, whatever its type, to these files, or to any .gitattributes
-# (attributes change how the gate's code is checked out) needs approvals by the
-# base policy's signers over a manifest of their contents. Every workflow is
-# gate code, since a workflow could post a check under the gate's name.
-GATE_CODE_PREFIXES = ("ci/release/", "ci/checks/", WORKFLOW_DIR, ".github/actions/")
-GATE_CODE_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS", "contrib/keys/README.md")
+# The gate's own code: the files that decide its result, and nothing else. The
+# job runs the workflow, which runs this script, which loads and runs the
+# validator; both import only the standard library and PyYAML, and the gate
+# runs with -I, so no other file in the checkout is read as code
+# (test_key_policy_gate_contract.py holds this list to what the two files
+# load). A change to one of these files needs approvals by the base policy's
+# signers over a manifest of their contents. Other workflows, CI scripts,
+# CODEOWNERS and .gitattributes are not gate code: code owners review them,
+# and the gate checks workflows and attributes itself (see check_target).
+GATE_CODE_PATHS = (GATE_WORKFLOW, GATE_SCRIPT, GATE_VALIDATOR)
 # Attributes that change the bytes a checkout writes, and those that change an archive too.
 CHECKOUT_CONTENT_ATTRIBUTES = ("text", "eol", "crlf", "filter", "ident", "working-tree-encoding")
 CHECKOUT_ATTRIBUTES = CHECKOUT_CONTENT_ATTRIBUTES + ("export-ignore", "export-subst")
@@ -174,41 +183,77 @@ def git(*args: str, data: bytes | None = None) -> bytes:
     return result.stdout
 
 
-fold = classify_merge_profile.fold_path
+def fold(path: str) -> str:
+    """A path as case-insensitive checkouts compare it: NFKC-normalised and case-folded."""
+
+    return unicodedata.normalize("NFKC", path).casefold()
+
+
+# The directories on the policy path: an entry in place of one (a symlink, a
+# file) changes what the path holds without a file under it.
+POLICY_PATH_ENTRIES = tuple(
+    "/".join(POLICY_DIR.split("/")[:depth]) for depth in range(1, len(POLICY_DIR.split("/")) + 1)
+)
+FOLDED_POLICY_PATH_ENTRIES = {fold(entry): entry for entry in POLICY_PATH_ENTRIES}
+
+
+def is_attributes_file(path: str) -> bool:
+    return fold(PurePosixPath(path).name) == ".gitattributes"
+
+
+def touches_policy(path: str) -> bool:
+    """Whether a change to `path` can change the key policy, or how its files are checked out or archived.
+
+    That is a file under POLICY_DIR, an entry in place of a directory on that
+    path, a path that spells either with other letters (compared folded, as a
+    case-insensitive checkout compares them), and any .gitattributes.
+    ci/checks/classify_merge_profile.py routes the same paths to the Required
+    Merge Gate's key job with its own touches_operator_keys;
+    test_key_policy_gate_contract.py holds the two to one answer.
+    """
+
+    folded = fold(path)
+    entries = FOLDED_POLICY_PATH_ENTRIES
+    components = path.split("/")
+    prefixes = ["/".join(components[:depth]) for depth in range(1, len(components) + 1)]
+    return (
+        folded.startswith(fold(POLICY_DIR + "/"))
+        or folded in entries
+        or any(fold(prefix) in entries and prefix != entries[fold(prefix)] for prefix in prefixes)
+        or is_attributes_file(path)
+    )
 
 
 FOLDED_GATE_CODE_PATHS = frozenset(fold(path) for path in GATE_CODE_PATHS)
-FOLDED_GATE_CODE_PREFIXES = tuple(fold(prefix) for prefix in GATE_CODE_PREFIXES)
-# The directories that hold gate code, and their parents: an entry there in
-# place of the directory would move gate code out of the gate, so it is gate
-# code too. A symlink or submodule there is refused as not a regular file; a
-# regular file needs approvals like any other gate code.
+# The directories that hold gate code: an entry in place of one would move
+# gate code out of the gate, so it is gate code too. A symlink or submodule
+# there is refused as not a regular file; a regular file needs approvals like
+# any other gate code.
 FOLDED_GATE_CODE_PARENTS = frozenset(
-    "/".join(parts[:depth])
-    for parts in [fold(prefix).rstrip("/").split("/") for prefix in GATE_CODE_PREFIXES]
-    for depth in range(1, len(parts) + 1)
-) | frozenset(
     "/".join(parts[:depth])
     for parts in [fold(path).split("/") for path in GATE_CODE_PATHS]
     for depth in range(1, len(parts))
 )
-
-
-def is_attributes_file(path: str) -> bool:
-    return fold(path.rsplit("/", 1)[-1]) == ".gitattributes"
+FOLDED_WORKFLOW_DIR = fold(WORKFLOW_DIR)
+# The directories .github/CODEOWNERS gives to the code owners, by their exact
+# spelling: GitHub matches CODEOWNERS and reads workflows case-sensitively, so
+# a path that spells one of them with other letters has no owner, and on a
+# case-insensitive checkout it is a file in that directory all the same.
+OWNED_DIRS = ("ci/release/", "ci/checks/", WORKFLOW_DIR, ".github/actions/")
 
 
 def is_gate_code(path: str) -> bool:
     """Whether `path` is gate code, compared folded: on a case-insensitive checkout
-    CI/release/x.py is the same file as ci/release/x.py."""
+    CI/release/key_policy_gate.py is the same file as ci/release/key_policy_gate.py."""
 
     folded = fold(path)
-    return (
-        folded in FOLDED_GATE_CODE_PATHS
-        or folded.startswith(FOLDED_GATE_CODE_PREFIXES)
-        or folded in FOLDED_GATE_CODE_PARENTS
-        or is_attributes_file(path)
-    )
+    return folded in FOLDED_GATE_CODE_PATHS or folded in FOLDED_GATE_CODE_PARENTS
+
+
+def is_workflow_file(path: str) -> bool:
+    """A file at the top of .github/workflows/, the only place GitHub reads workflows from."""
+
+    return path.startswith(WORKFLOW_DIR) and "/" not in path[len(WORKFLOW_DIR) :]
 
 
 def is_gate_approval_file(path: str) -> bool:
@@ -378,8 +423,7 @@ def refuse_checkout_attributes(rev: str, names: list[str], what: str, attributes
 def check_folded_paths(rev: str) -> None:
     """Refuse paths that equal the policy path, or .gitattributes, only after NFKC case folding."""
 
-    parts = POLICY_DIR.split("/")
-    guarded = {fold("/".join(parts[:depth])): "/".join(parts[:depth]) for depth in range(1, len(parts) + 1)}
+    guarded = FOLDED_POLICY_PATH_ENTRIES
     problems = []
     seen: dict[str, str] = {}
     for _mode, _kind, _oid, path in tree(rev):
@@ -444,14 +488,14 @@ def check_policy(base: str, head: str, work: Path) -> None:
         "--base-operator-keys-dir", str(base_dir),
     ]
     # Once any first-parent ancestor of the base had a policy, the base must have one.
-    if git("rev-list", "--first-parent", "-n", "1", base, "--", f"{POLICY_DIR}/keys.json").strip():
+    if git("rev-list", "--first-parent", "-n", "1", base, "--", POLICY_FILE).strip():
         head_args.append("--base-history-had-policy")
     run(head_args, "validate_key_metadata.py")
 
     if file_map(head_dir) == file_map(base_dir):
         return
     # The base's own validator, read from git objects, with arguments every version of it accepts.
-    validator = "ci/release/validate_key_metadata.py"
+    validator = GATE_VALIDATOR
     entry = tree_entry(base, validator)
     if entry is None or entry[:2] not in {("100644", "blob"), ("100755", "blob")}:
         raise GateError(f"The base has no {validator} to check this change with.")
@@ -488,6 +532,12 @@ def gate_files(rev: str) -> dict[str, bytes]:
     """The gate code files at `rev`: see is_gate_code."""
 
     return dict(commit_files(resolve(rev), is_gate_code))
+
+
+def workflow_files(rev: str) -> dict[str, bytes]:
+    """The files at the top of .github/workflows/ at `rev`, each of which must be a regular file."""
+
+    return dict(commit_files(resolve(rev), is_workflow_file))
 
 
 def gate_manifest(base: str, head: str) -> bytes:
@@ -896,14 +946,13 @@ def check_gate_check_name(head: str, changed: list[str]) -> None:
     and no workflow or job may ask for `checks: write`, `statuses: write` or
     `write-all`. A workflow the pull request adds or changes must also declare
     its token permissions, for itself or for every job, rather than take the
-    repository's default. This cannot stop code that posts a check by other
-    means at run time; see contrib/keys/README.md.
+    repository's default. The gate refuses these by itself, with no approvals:
+    only the gate's own workflow is gate code. This cannot stop code that
+    posts a check by other means at run time; see contrib/keys/README.md.
     """
 
-    for path, data in sorted(gate_files(head).items()):
-        # GitHub reads workflows only from the top of .github/workflows/.
-        if not path.startswith(WORKFLOW_DIR) or "/" in path[len(WORKFLOW_DIR) :]:
-            continue
+    # GitHub reads workflows only from the top of .github/workflows/.
+    for path, data in sorted(workflow_files(head).items()):
         if path == GATE_WORKFLOW:
             check_gate_workflow(path, data)
             continue
@@ -944,7 +993,6 @@ def check_gate_approvals(base: str, head: str, changed: list[str], work: Path) -
 
     if not contains(head, base):
         raise GateError("bring the pull request up to date with its base branch before a gate change is approved")
-    check_gate_check_name(head, changed)
     manifest = gate_manifest(base, head)
     approval_dir = f"{GATE_APPROVALS_DIR}/{hashlib.sha256(manifest).hexdigest()}"
     stray = [path for path in changed if is_gate_approval_file(path) and not path.startswith(approval_dir + "/")]
@@ -1021,7 +1069,8 @@ def check_gate_approvals(base: str, head: str, changed: list[str], work: Path) -
 
 
 def check_target(base: str, head: str, work: Path) -> None:
-    bytecode = [path for _mode, _kind, _oid, path in tree(head) if is_bytecode(path)]
+    present = {path for _mode, _kind, _oid, path in tree(head)}
+    bytecode = sorted(path for path in present if is_bytecode(path))
     if bytecode:
         raise GateError(f"Python bytecode caches may not be committed: {', '.join(map(shown, bytecode))}")
     # The head must contain the base branch's tip. Then the diff from the base
@@ -1030,13 +1079,17 @@ def check_target(base: str, head: str, work: Path) -> None:
     # differ from what the gate checked.
     if not contains(head, base):
         raise GateError("bring the pull request up to date with its base branch: the gate checks a head that contains it")
+    # --ignore-submodules=none: a .gitmodules entry in the base's checkout
+    # (ignore = all) must not hide a submodule entry the head adds.
     changed = [
         name.decode("utf8", errors="surrogateescape")
-        for name in split_nul(git("diff", "--no-renames", "--name-only", "-z", base, head))
+        for name in split_nul(git("diff", "--no-renames", "--ignore-submodules=none", "--name-only", "-z", base, head))
     ]
-    policy = [path for path in changed if classify_merge_profile.touches_operator_keys(path)]
+    policy = [path for path in changed if touches_policy(path)]
     gate = [path for path in changed if is_gate_code(path)]
     approvals = [path for path in changed if is_gate_approval_file(path)]
+    attributes = [path for path in changed if is_attributes_file(path)]
+    workflows = [path for path in changed if fold(path).startswith(FOLDED_WORKFLOW_DIR)]
     other = [
         path
         for path in changed
@@ -1054,13 +1107,23 @@ def check_target(base: str, head: str, work: Path) -> None:
         check_policy(base, head, work / "policy")
     if gate:
         print(f"Gate code changed: {', '.join(map(shown, gate))}")
-        # The gate's own checkout must hold its code byte for byte.
-        refuse_checkout_attributes(
-            head,
-            sorted(path for path in gate_files(head) if fold(path).startswith(FOLDED_GATE_CODE_PREFIXES)),
-            "the gate's code",
-            CHECKOUT_CONTENT_ATTRIBUTES,
-        )
+    if gate or attributes:
+        # The gate's own checkout must hold its code byte for byte, whatever
+        # attribute file a pull request changes. No approval allows otherwise.
+        refuse_checkout_attributes(head, sorted(gate_files(head)), "the gate's code", CHECKOUT_CONTENT_ATTRIBUTES)
+    # A path a pull request removes is not refused for its spelling.
+    for directory in OWNED_DIRS:
+        misspelt = [
+            path for path in changed
+            if fold(path).startswith(fold(directory)) and not path.startswith(directory) and path in present
+        ]
+        if misspelt:
+            raise GateError(f"{', '.join(map(shown, misspelt))} names {directory} with other letters")
+    if gate or workflows:
+        if workflows:
+            print(f"Workflows changed: {', '.join(map(shown, workflows))}")
+        check_gate_check_name(head, changed)
+    if gate:
         print(check_gate_approvals(base, head, changed, work / "gate"))
     if not policy and not gate:
         print("No key policy or gate code path changed")
