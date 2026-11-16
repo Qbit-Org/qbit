@@ -1,0 +1,668 @@
+{
+  "schema_version": 1,
+  "profile": "qbit-p2mr-v1",
+  "profile_version": 1,
+  "manifest_sha256": "00cd4e1cc25a0540e3a0d372737b490a66eeff2bea9b09f4cccccc5fa97cd7ab",
+  "oracle": {
+    "name": "p2mr-v1-oracle",
+    "version": "1",
+    "commit": "0439a7e5b37fb3f7e4ddfb735b68961445a882c8"
+  },
+  "reference_implementation_commit": "988756471aeecdf4463c04be49da2b7b89a98c21",
+  "manifest_case_counts": {
+    "commitment_invalid": 7,
+    "commitment_valid": 4,
+    "cross_profile": 2,
+    "script_boundary": 53,
+    "witness": 14
+  },
+  "case_counts": {
+    "total": 80,
+    "accepted": 36,
+    "rejected": 44,
+    "cross_profile": 2
+  },
+  "result": "pass",
+  "cases": [
+    {
+      "id": "branch_codesep_false",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "branch_codesep_true",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "control-depth-128",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "control-depth-129",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "control-size",
+      "observed_error": "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"
+    },
+    {
+      "id": "control-direct-root-mismatch",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "commitment",
+      "observed_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+    },
+    {
+      "id": "control-marker-zero",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "control-marker",
+      "observed_error": "SCRIPT_ERR_P2MR_CONTROL_BIT0"
+    },
+    {
+      "id": "control-minimum",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "control-mutated-path-node",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "commitment",
+      "observed_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+    },
+    {
+      "id": "control-nonmultiple-length",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "control-size",
+      "observed_error": "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"
+    },
+    {
+      "id": "leaf-c0-false",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_EVAL_FALSE"
+    },
+    {
+      "id": "leaf-c0-true",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "leaf-experimental",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "upgrade-success",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "leaf-extension-fe",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "upgrade-success",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "leaf-odd-control-mask",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "upgrade-success",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "leaf-production-reserved",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "upgrade-success",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "leaf-staged-signature-system",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "upgrade-success",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "malformed_control_block_size",
+      "category": "commitment",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "control-size",
+      "observed_error": "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"
+    },
+    {
+      "id": "missing_bit0_control_marker",
+      "category": "commitment",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "control-marker",
+      "observed_error": "SCRIPT_ERR_P2MR_CONTROL_BIT0"
+    },
+    {
+      "id": "mutated_sibling",
+      "category": "commitment",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "commitment",
+      "observed_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+    },
+    {
+      "id": "opcode-checkdatasigaddpqc",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "opcode-checkdatasigaddpqc-underflow",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
+    },
+    {
+      "id": "opcode-checkdatasigaddpqc-wrong-message",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_P2MR_SIG"
+    },
+    {
+      "id": "opcode-checkdatasigaddpqc-wrong-pubkey",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_P2MR_SIG"
+    },
+    {
+      "id": "opcode-checkdatasigpqc",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "opcode-checkdatasigpqc-invalid-signature",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_P2MR_SIG"
+    },
+    {
+      "id": "opcode-checkdatasigpqc-underflow",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
+    },
+    {
+      "id": "opcode-checkdatasigpqc-wrong-domain",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_P2MR_SIG"
+    },
+    {
+      "id": "opcode-checksigadd-pqc",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "opcode-checksigadd-pqc-underflow",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
+    },
+    {
+      "id": "opcode-checksigpqc-bad-key",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_PUBKEYTYPE"
+    },
+    {
+      "id": "opcode-checksigpqc-bad-size",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_P2MR_SIG_SIZE"
+    },
+    {
+      "id": "opcode-checksigpqc-empty-signature",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_VERIFY"
+    },
+    {
+      "id": "opcode-checksigpqc-invalid-signature",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_P2MR_SIG"
+    },
+    {
+      "id": "opcode-checksigpqc-underflow",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
+    },
+    {
+      "id": "opcode-checksigpqc-valid",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "opcode-ctv-mismatch",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_TEMPLATE_MISMATCH"
+    },
+    {
+      "id": "opcode-ctv-valid",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "opcode-legacy-checkmultisig",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG"
+    },
+    {
+      "id": "opcode-legacy-checksig",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_P2MR_CHECKSIG"
+    },
+    {
+      "id": "opcode-nonactivated-op-success",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "op-success",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "opcode-permanently-disabled",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script",
+      "observed_error": "SCRIPT_ERR_BAD_OPCODE"
+    },
+    {
+      "id": "pinned-bip-root-rejected-by-qbit",
+      "category": "cross_profile",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "commitment",
+      "observed_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+    },
+    {
+      "id": "qbit-root-executes-depth-zero-script",
+      "category": "cross_profile",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script-execution",
+      "observed_error": "SCRIPT_ERR_EVAL_FALSE"
+    },
+    {
+      "id": "resource-clean-stack",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_CLEANSTACK"
+    },
+    {
+      "id": "resource-empty-signatures-no-charge",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "resource-false-final-stack",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_EVAL_FALSE"
+    },
+    {
+      "id": "resource-item-bytes-16384",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "resource-item-bytes-16385",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "initial-stack",
+      "observed_error": "SCRIPT_ERR_PUSH_SIZE"
+    },
+    {
+      "id": "resource-runtime-stack-bytes-1048576",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "resource-runtime-stack-bytes-1048577",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "resource-stack-items-1000",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "resource-stack-items-1001",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "initial-stack",
+      "observed_error": "SCRIPT_ERR_STACK_SIZE"
+    },
+    {
+      "id": "resource-total-bytes-131072",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "resource-total-bytes-131073",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "initial-stack",
+      "observed_error": "SCRIPT_ERR_PUSH_SIZE"
+    },
+    {
+      "id": "resource-validation-weight-exceeded",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "validation-weight",
+      "observed_error": "SCRIPT_ERR_P2MR_VALIDATION_WEIGHT"
+    },
+    {
+      "id": "resource-validation-weight-multiple",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "resource-validation-weight-one",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "single_key_default_sighash",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "single_key_default_sighash_annex_present",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "single_key_leading_codesep",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "single_key_sighash_all_anyonecanpay",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "single_key_sighash_none",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "single_key_sighash_none_anyonecanpay",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "single_key_sighash_single_anyonecanpay",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "single_key_sighash_single_anyonecanpay_missing_beyond",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "sighash",
+      "observed_error": "SCRIPT_ERR_P2MR_SIG_HASHTYPE"
+    },
+    {
+      "id": "single_key_sighash_single_anyonecanpay_missing_first",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "sighash",
+      "observed_error": "SCRIPT_ERR_P2MR_SIG_HASHTYPE"
+    },
+    {
+      "id": "single_key_sighash_single_matching_output",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "single_key_sighash_single_missing_beyond",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "sighash",
+      "observed_error": "SCRIPT_ERR_P2MR_SIG_HASHTYPE"
+    },
+    {
+      "id": "single_key_sighash_single_missing_first",
+      "category": "witness",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "sighash",
+      "observed_error": "SCRIPT_ERR_P2MR_SIG_HASHTYPE"
+    },
+    {
+      "id": "single_leaf_op_true",
+      "category": "commitment",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "three_leaf_two_level_spend_middle_leaf",
+      "category": "commitment",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "two_leaf_op_true_with_op_false_sibling",
+      "category": "commitment",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "two_leaf_spent_hash_sorts_after_sibling",
+      "category": "commitment",
+      "result": "pass",
+      "observed_accept": true,
+      "observed_stage": "script-complete",
+      "observed_error": "SCRIPT_ERR_OK"
+    },
+    {
+      "id": "unsorted_branch_preimage_when_spent_hash_sorts_after_sibling",
+      "category": "commitment",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "commitment",
+      "observed_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+    },
+    {
+      "id": "witness-annex-underflow",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "witness",
+      "observed_error": "SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"
+    },
+    {
+      "id": "witness-empty",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "witness",
+      "observed_error": "SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"
+    },
+    {
+      "id": "witness-one-element",
+      "category": "script_boundary",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "witness",
+      "observed_error": "SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"
+    },
+    {
+      "id": "wrong_address_root_commitment",
+      "category": "commitment",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "commitment",
+      "observed_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+    },
+    {
+      "id": "wrong_compactsize_script_length_encoding",
+      "category": "commitment",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "commitment",
+      "observed_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+    },
+    {
+      "id": "wrong_leaf_version",
+      "category": "commitment",
+      "result": "pass",
+      "observed_accept": false,
+      "observed_stage": "commitment",
+      "observed_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+    }
+  ]
+}
