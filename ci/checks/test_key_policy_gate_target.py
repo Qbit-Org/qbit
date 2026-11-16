@@ -1034,9 +1034,21 @@ class BranchRulesetStepTest(unittest.TestCase):
         return run_bash_step(self.script, rulesets.parent.parent, env)
 
     def copy_rulesets(self, root: Path) -> Path:
+        # The step also reads the merge-method settings beside the rulesets.
         rulesets = root / ".github" / "rulesets"
         shutil.copytree(REPO_ROOT / ".github" / "rulesets", rulesets)
+        shutil.copytree(REPO_ROOT / ".github" / "repository-settings", root / ".github" / "repository-settings")
         return rulesets
+
+    def edit_json(self, path: Path, edit) -> None:
+        data = json.loads(path.read_text(encoding="utf8"))
+        edit(data)
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf8")
+
+    def assert_step_fails(self, rulesets: Path, message: str) -> None:
+        result = self.run_step(rulesets)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(message, result.stdout + result.stderr)
 
     def test_the_templates_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1055,6 +1067,46 @@ class BranchRulesetStepTest(unittest.TestCase):
                 result = self.run_step(rulesets)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("require_extra_approval_for_unattributed_changes must be true", result.stdout + result.stderr)
+
+    def test_the_merge_methods_must_be_squash_and_merge(self) -> None:
+        def set_methods(methods):
+            def edit(data):
+                for rule in data["rules"]:
+                    if rule["type"] == "pull_request":
+                        rule["parameters"]["allowed_merge_methods"] = methods
+            return edit
+
+        for name in ("main.json", "1.x.x.json", "1.0.0.json", "0.1.x.json"):
+            with self.subTest(template=name, methods="squash, merge"), tempfile.TemporaryDirectory() as tmp:
+                rulesets = self.copy_rulesets(Path(tmp))
+                self.edit_json(rulesets / name, set_methods(["squash", "merge"]))
+                result = self.run_step(rulesets)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for methods in (["merge"], ["squash"], ["merge", "squash", "rebase"], None):
+                with self.subTest(template=name, methods=methods), tempfile.TemporaryDirectory() as tmp:
+                    rulesets = self.copy_rulesets(Path(tmp))
+                    self.edit_json(rulesets / name, set_methods(methods))
+                    self.assert_step_fails(rulesets, "allowed merge methods must be merge and squash")
+
+    def test_a_template_requiring_linear_history_fails(self) -> None:
+        for name in ("main.json", "1.x.x.json", "1.0.0.json", "0.1.x.json"):
+            with self.subTest(template=name), tempfile.TemporaryDirectory() as tmp:
+                rulesets = self.copy_rulesets(Path(tmp))
+                self.edit_json(rulesets / name, lambda data: data["rules"].append({"type": "required_linear_history"}))
+                self.assert_step_fails(rulesets, "required_linear_history must be absent")
+
+    def test_the_merge_method_settings_must_allow_squash_and_merge_only(self) -> None:
+        for key, value in (
+            ("allow_squash_merge", False),
+            ("allow_merge_commit", False),
+            ("allow_rebase_merge", True),
+            ("allow_auto_merge", True),
+        ):
+            with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as tmp:
+                rulesets = self.copy_rulesets(Path(tmp))
+                settings = rulesets.parent / "repository-settings" / "merge-methods.json"
+                self.edit_json(settings, lambda data: data.__setitem__(key, value))
+                self.assert_step_fails(rulesets, "merge-methods.json: must be")
 
 
 if __name__ == "__main__":

@@ -188,10 +188,11 @@ lowercase() {
 
 on_first_parent_history() {
     # Succeeds if commit is on the first-parent history of history_ref, the
-    # sequence of states that branch actually had. Under merge commits, any
-    # other ancestor, including a merged pull request's head, can have a tree
-    # the branch never had. awk reads the whole list, so pipefail cannot fail
-    # on an early exit, and an unknown ref fails rev-list.
+    # sequence of states that branch actually had. Any other ancestor, such as
+    # the head of a pull request a merge commit landed (a subtree update or a
+    # line merge in qbit, every pull request in qbit-guix.sigs), can have a
+    # tree the branch never had. awk reads the whole list, so pipefail cannot
+    # fail on an early exit, and an unknown ref fails rev-list.
     local root="$1"
     local history_ref="$2"
     local commit

@@ -241,11 +241,12 @@ every step, so pull requests stay mergeable throughout.
 
 ### Rolling Back
 
-The merge-commit path was proven on `qbit-white-paper` before the switch:
-spike pull request #6 merged a signed commit with a merge commit, and #7 ran the
-full `squash-sign` flow. If merges still stall after the switch, roll back in
-the order below. Each step leaves at least one merge method that both the
-branch rulesets and the repository allow, so merges never freeze:
+The merge-commit path, which `sync-` and `subtree-` pull requests take, was
+proven on `qbit-white-paper` before the switch: spike pull request #6 merged a
+signed commit with a merge commit, and #7 ran the full `squash-sign` flow. If
+merges still stall after the switch, roll back in the order below. Each step
+leaves at least one merge method that both the branch rulesets and the
+repository allow, so merges never freeze:
 
 1. Optional: set the `signed-commits` ruleset enforcement to `disabled`
    (Settings → Rules → Rulesets → `signed-commits`), keeping the ruleset so
@@ -441,9 +442,9 @@ the exact conditions:
 
 - For a squash merge, `signed-landing` is a required check of the base branch
   through a ruleset the caller cannot bypass, and it has passed on the pull
-  request's head. For a merge-commit landing, GitHub checks the signature of
-  every commit the merge adds, even under `--admin`, because the
-  `signed-commits` ruleset binds every actor.
+  request's head. For a merge-commit landing, a signature rule binds the
+  caller, as the `signed-commits` ruleset binds every actor, so GitHub checks
+  the signature of every commit the merge adds, even under `--admin`.
 - Every other required status check has passed on the pull request's head,
   including checks bound to a GitHub App, where the check's `app.id` must
   match the required integration, and the branch is up to date with its base
@@ -463,13 +464,15 @@ organization admin's credentials.
 
 Agents never run plain `gh pr merge --admin`: it skips all of these checks,
 because `OrganizationAdmin` bypasses the branch rulesets. The `signed-commits`
-ruleset has no bypass actors, so GitHub still refuses unsigned commits, even for
-admins.
+ruleset has no bypass actors, so GitHub still refuses an unsigned commit that a
+merge commit would add, even for admins, but accepts a squash merge of any pull
+request, because it signs the squash commit itself.
 
 The rule accepts any commit that GitHub marks Verified. GitHub signs only
-commits it creates itself through its API or web UI: GraphQL
-`createCommitOnBranch`, a commit created through the API with `GITHUB_TOKEN`,
-and web UI edits. Those pass the rule without an operator signature. A bot that
+commits it creates itself through its API or web UI: the squash and merge
+commits that land pull requests, GraphQL `createCommitOnBranch`, a commit
+created through the API with `GITHUB_TOKEN`, and web UI edits. Those pass the
+rule without an operator signature. A bot that
 creates a commit locally and runs `git push` sends an unsigned commit, which
 GitHub refuses. `squash-sign verify` and a daily `squash-sign audit`, which run
 outside this repository, cover the GitHub-signed gap by process, and so, once a
@@ -508,8 +511,9 @@ itself, because it also accepts commits GitHub signs: squash merges, web edits,
 squash merge, so the commit on the branch carries GitHub's signature, and this
 check is what requires the person's, on the pull request's head. So on an open
 pull request the check is red until a maintainer has squashed and signed it
-with `squash-sign apply`; that is expected, not a failure. Its result belongs to the head commit, so it passes
-only if every open pull request with that head commit may land. It reads the
+with `squash-sign apply`; that is expected, not a failure. Its result belongs to
+the head commit, so it passes only if every open pull request with that head
+commit may land. It reads the
 pull request through GitHub's API and never checks out or runs its code. The
 workflow's opening comment points to `.github/rulesets/README.md`, where the
 other Qbit-Org repositories describe how a pull request lands; in qbit, this
@@ -525,7 +529,8 @@ path segment at a time, and only a branch in this repository, never a fork's:
 | `subtree-<name>`, such as `subtree-leveldb` | The standard two-commit subtree update (see [Signed Commits](#signed-commits)), which lands as it is with a merge commit through `squash-sign merge --keep-commits`. |
 
 Their commits must already be signed: for a merge commit, GitHub's signature
-rule checks every commit the merge adds to the branch. The `sync/public-snapshot/<date-or-version>` branches in
+rule checks every commit the merge adds to the branch. The
+`sync/public-snapshot/<date-or-version>` branches in
 [Public Branch Set](#public-branch-set) are not `sync-` branches; they target
 `main`, which does not require this check.
 
@@ -554,8 +559,10 @@ Organization admins can bypass the check on these branches. It is a rule of
 the branch rulesets, and qbit's branch rulesets keep their `OrganizationAdmin`
 bypass for the release move of `main` and the break-glass import above. The
 other Qbit-Org repositories hold the check in a ruleset nobody can bypass; qbit
-does not. `squash-sign merge --admin-approvals` passes `--admin` only when
-every required status check, this one included, is green.
+does not, so `squash-sign merge --admin-approvals` refuses `--admin` for a
+squash merge into these branches (see [Signed Commits](#signed-commits)): an
+ordinary pull request lands with its approvals or by the operator's own
+merge.
 
 ## Operational Notes
 

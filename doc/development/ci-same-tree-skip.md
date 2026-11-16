@@ -1,9 +1,10 @@
 # Skipping CI for a tree that already passed
 
-A pull request lands as one signed commit made by `squash-sign apply`. That
-commit has exactly the same tree as the head that was reviewed, but GitHub
-records checks per commit, so it would run Full Validation (`ci.yml`) and Core
-Checks (`core-checks.yml`) again from scratch. Label changes do the same.
+Before a pull request lands, `squash-sign apply` replaces it with one signed
+commit. That commit has exactly the same tree as the head that was reviewed,
+but GitHub records checks per commit, so it would run Full Validation
+(`ci.yml`) and Core Checks (`core-checks.yml`) again from scratch. Label
+changes do the same.
 
 Instead, a pull request run whose commit under test has a tree that already
 passed the workflow, routed the same way, skips the workflow's expensive jobs.
@@ -79,8 +80,8 @@ pull request waits for, docs-only ones included.
 - Core Checks' `same-tree skip contract` job, which runs this mechanism's own
   tests (above).
 - Full Validation's `lint commit range` job, which runs the lints that read
-  history rather than the tree. The signed commit that lands has the same tree
-  as the reviewed head but new history, so these lints must run on it. They
+  history rather than the tree. The signed commit has the same tree as the
+  reviewed head but new history, so these lints must run on it. They
   are cheap, and the gate still requires them. Of the test runner's lints,
   three read history:
   - `commit_msg` reads the messages of the pull request's commits;
@@ -154,8 +155,9 @@ the SHA-256 of the full marker key (run and attempt included). Only after that
 upload succeeds does it save the marker in the Actions cache. Both steps use
 `continue-on-error`: a failed upload or save only means the next run does the
 work again. The artifact is kept for 30 days; the cache drops a marker after 7
-days without use, and in this repository much sooner, when the full cache
-evicts it ([a marker lives about two hours](#what-remains-possible)).
+days without use, and in this repository often much sooner, when the full
+cache evicts it
+([a marker can be counted on for about two hours](#what-remains-possible)).
 
 ### Deciding to skip
 
@@ -431,15 +433,17 @@ These are the cases the checks above do not exclude:
   vouching run but started before it), a run still in progress, and a pull
   request with 1,000 or more runs of the workflow all lead to a full run,
   never to a skip.
-- **A marker lives about two hours.** This repository's Actions cache holds
-  about 9 GiB of its 10 GiB limit, and GitHub evicts the oldest entries to stay
-  under it, so the cache turns over in about two hours and a marker is gone
-  about that long after it is saved. #423's validation showed it: on
-  13 November, Core Checks' marker, saved seven and a half hours earlier, was
-  gone, while Full Validation's, saved minutes earlier, was found. A landing
-  therefore skips only if its push comes within about two hours of the full
-  run that saved the marker. A missing marker means a full run, never a wrong
-  skip.
+- **A marker can be counted on for about two hours.** This repository's
+  Actions cache is kept at its 10 GiB limit (it held about 9 GiB when #423 was
+  validated), and GitHub evicts entries to stay under it, so most of the cache
+  turns over within hours, and a marker can be gone about two hours after it
+  is saved. #423's validation showed it: on 13 November, Core Checks' marker,
+  saved seven and a half hours earlier, was gone, while Full Validation's,
+  saved minutes earlier, was found. Some markers are kept much longer (on
+  16 November one that #423 saved the day before was still there), but none
+  can be relied on. A landing can therefore count on skipping only if its push
+  comes within about two hours of the full run that saved the marker. A
+  missing marker means a full run, never a wrong skip.
 
 ## When a landing skips
 
@@ -456,9 +460,9 @@ A landing therefore skips when all of these hold:
 
 - the base has not moved since the vouching run, the last full run that
   passed and saved;
-- the squash was pushed within about two hours of that run, while its marker
-  is still in the cache
-  ([a marker lives about two hours](#what-remains-possible));
+- that run's marker is still in the cache when the squash is pushed, which
+  can be counted on only within about two hours of that run
+  ([a marker can be counted on for about two hours](#what-remains-possible));
 - that run's `save pass marker` job finished before the squash was pushed.
   Both workflows cancel a running run on a new push, so a squash pushed while
   the run is still saving cancels it before it saves. The save job starts
