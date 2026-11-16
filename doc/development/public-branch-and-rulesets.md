@@ -707,11 +707,14 @@ span more than one lightweight profile, also use full source validation.
 Merge queue is not enabled in these templates. Enable it only after public CI
 supports `merge_group` events.
 
-Code-owner review is required on `main` and `1.x.x`: `.github/CODEOWNERS` gives
-`contrib/keys/`, `ci/release/`, `ci/checks/`, `.github/workflows/`,
-`.github/actions/` and every `.gitattributes` to
-`@Qbit-Org/release-maintainers`. The other maintenance branches do not require
-it yet. GitHub applies a team as code owner only once the team has write
+The templates require code-owner review on `main` and `1.x.x`:
+`.github/CODEOWNERS` gives `contrib/keys/`, `ci/release/`, `ci/checks/`,
+`.github/workflows/`, `.github/actions/`, every `.gitattributes` and the
+three places GitHub reads a `CODEOWNERS` file from to
+`@Qbit-Org/release-maintainers`. It is the review for every change to those
+paths that the Key Policy Gate does not ask signatures for: the gate's code
+is only its workflow, its script and its validator. The other maintenance
+branches do not require it yet. GitHub applies a team as code owner only once the team has write
 access to the repository; until an organization owner grants it, code-owner
 review requires nothing.
 

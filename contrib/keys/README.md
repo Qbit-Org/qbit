@@ -192,31 +192,53 @@ pull request brings, as long as the branch's ruleset requires pull requests to
 be up to date before merging (the gate does not run again when only the base
 moves). It finds the paths the pull request changes against that tip:
 
-- A change to the key policy (any path the classifier routes to the key job)
-  gets the checks above, run by the base's validator.
-- A change to the gate's own code (`GATE_CODE_PREFIXES` and
-  `GATE_CODE_PATHS` in the base's `key_policy_gate.py`) needs approvals by the
-  base policy's signers, as below. Gate code is every file under `ci/release/`,
-  `ci/checks/`, `.github/workflows/` and `.github/actions/`, whatever its type
-  (every workflow counts, since any workflow could post a check under the
-  gate's name), every `CODEOWNERS` file GitHub reads (`.github/`, the root,
-  `docs/`), this README, and every `.gitattributes` at any depth, since
-  attributes change how the gate's code is checked out. The directories
-  themselves and their parents (`ci`, `.github`, `docs`, `contrib`, ...) are
-  gate code too: a symlink in place of one is refused, and a file in place of
-  one needs approvals. Paths are compared
-  case-insensitively (NFKC, then case-folded), as a case-insensitive checkout
-  would compare them. No attribute that changes a checkout's bytes (`text`,
-  `eol`, `crlf`, `filter`, `ident`, `working-tree-encoding`) may be set or
-  given a value for files under those four directories, even with approvals;
-  unset (`-text`, `binary`) is allowed.
+- A change to the key policy (the policy path, a directory on it, a path that
+  spells either with other letters, or any `.gitattributes`: `touches_policy`
+  in the base's `key_policy_gate.py`) gets the checks above, run by the
+  base's validator.
+- A change to the gate's own code (`GATE_CODE_PATHS` in the base's
+  `key_policy_gate.py`) needs approvals by the base policy's signers, as
+  below. Gate code is the three files that decide the gate's result:
+  `.github/workflows/key-policy-gate.yml`, `ci/release/key_policy_gate.py`,
+  and `ci/release/validate_key_metadata.py`, the one module the script loads.
+  Both scripts import only the standard library and PyYAML and the job runs
+  them with `-I`, so no other file in the checkout is read as code.
+  `ci/checks/test_key_policy_gate_contract.py` reads both sources and fails
+  if either imports another module, loads one by path, or names another
+  script outside a docstring; such a file would have to join the list.
+  The directories that hold the three files (`ci`, `ci/release`, `.github`,
+  `.github/workflows`) count too: a symlink in place of one is refused, and a
+  file in place of one needs approvals. Paths are compared case-insensitively
+  (NFKC, then case-folded), as a case-insensitive checkout would compare them.
+- A change to any `.gitattributes` is checked against the gate's code, with no
+  approvals: no attribute that changes a checkout's bytes (`text`, `eol`,
+  `crlf`, `filter`, `ident`, `working-tree-encoding`) may be set or given a
+  value for those three files, whichever attribute file sets it; unset
+  (`-text`, `binary`) is allowed.
+- A change to any workflow gets the workflow check below, with no approvals.
+- A pull request may not add or change a path that spells `ci/release/`,
+  `ci/checks/`, `.github/workflows/` or `.github/actions/` with other letters
+  (`CI/release/x.py`): GitHub gives such a path no code owner, and a
+  case-insensitive checkout puts it in that directory all the same. Removing
+  one is allowed.
 - Any other file under `contrib/keys/` is refused.
 - The pull request's head may not hold a Python bytecode cache (a
   `__pycache__` directory or a `.pyc`/`.pyo` file) anywhere in its tree;
   `test/lint/lint-files.py` checks the same for tracked files.
 
-Only `key-policy-gate.yml` may name a job `Key Policy Gate`. On a gate change
-the gate parses every workflow with the distribution's PyYAML, refusing
+Nothing else is gate code. Other workflows, composite actions, the rest of
+`ci/checks/` and `ci/release/`, `CODEOWNERS` and this README need no
+signatures: `.github/CODEOWNERS` gives those paths, itself and the two other
+places GitHub reads a `CODEOWNERS` file from to
+`@Qbit-Org/release-maintainers`, and the ruleset templates for `main` and
+`1.x.x` require code-owner review. That review is in force only once the gate
+is armed: the team has write access to the repository and the rulesets are
+applied (steps 5 and 6 of "Arming the gate" below, in that order). Until
+then, those paths need neither signatures nor a code owner's review.
+
+Only `key-policy-gate.yml` may name a job `Key Policy Gate`. When a pull
+request changes a workflow or the gate's code, the gate parses every workflow
+at the top of `.github/workflows/` with the distribution's PyYAML, refusing
 repeated keys, explicit YAML tags (`!!str` and the like) and control or
 separator characters in any of them, and refuses a workflow or job name that
 can evaluate to the
@@ -228,7 +250,9 @@ matrix stands for any text. It also refuses `checks: write`,
 `statuses: write` and `write-all`, and a workflow the pull request adds or
 changes must declare its token permissions, for itself or for every job.
 `ci-nightly-heavy.yml` and `lint-image-prewarm.yml` declare none yet, so the
-pull request that next changes either must add them. This is a defence in
+pull request that next changes either must add them. A workflow there must be
+a regular file. The gate refuses all of this by itself: no approval allows it,
+and none is needed for a workflow that passes. This is a defence in
 depth, not a guarantee: a required check is matched by name and app, so any
 workflow run that may post checks or statuses on the pull request's head (its
 own `pull_request` workflows, or a workflow on another branch) could post one
@@ -268,7 +292,7 @@ The job runs the gate as `python3 -I -B -X pycache_prefix=<new empty
 directory>`, and the gate refuses to start otherwise, before importing
 anything but built-in modules; its own child processes run the same way.
 `-I` keeps the script's directory off the module search path, and the gate
-loads its two modules from their own files, so a file added beside it cannot
+loads its one module from its own file, so a file added beside it cannot
 stand in for a module it imports. `-B` and a pycache prefix outside the
 checkout keep Python from reading a bytecode cache from the checkout, which
 `-I` alone does not. It runs again when a pull request's base branch
@@ -288,14 +312,22 @@ this order:
 4. an Actions event policy allows `pull_request_target` for
    `.github/workflows/key-policy-gate.yml` (workflow file targeting), before
    2026-12-02;
-5. the `main` and `1.x.x` rulesets require `Key Policy Gate (main)` and
+5. `@Qbit-Org/release-maintainers` gets write access, so CODEOWNERS applies:
+   code-owner review is what covers the workflows, CI scripts and `CODEOWNERS`
+   files the gate asks no signatures for, and until the team has write access
+   it requires nothing;
+6. the `main` and `1.x.x` rulesets require `Key Policy Gate (main)` and
    `Key Policy Gate (1.x.x)` respectively (GitHub Actions, integration 15368),
    with code-owner review and up-to-date branches, as `.github/rulesets/`
-   describes;
-6. `@Qbit-Org/release-maintainers` gets write access, so CODEOWNERS applies.
+   describes.
 
 No ruleset may require the gate before step 3: until `main` holds the
 workflow, no run posts the check, and pull requests would wait for it forever.
+Each branch is checked by its own copy of the gate script. `main` holds the
+earlier one, for which every workflow and CI script is gate code, until a
+release brings this version there: require the gate on `main` only after
+that, or every pull request into `main` that touches those paths needs the
+signers' approvals.
 The gate does not check the pull request that adds it.
 
 Once armed, each protected branch keeps its own gate approvals, and a pull
