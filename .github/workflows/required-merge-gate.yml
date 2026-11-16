@@ -605,6 +605,8 @@ jobs:
               strict = None
               code_owner_review = None
               unattributed = None
+              merge_methods = None
+              linear_history = False
               for rule in data.get("rules", []):
                   parameters = rule.get("parameters", {})
                   if rule.get("type") == "required_status_checks":
@@ -613,9 +615,18 @@ jobs:
                   if rule.get("type") == "pull_request":
                       code_owner_review = parameters.get("require_code_owner_review")
                       unattributed = parameters.get("require_extra_approval_for_unattributed_changes")
+                      merge_methods = parameters.get("allowed_merge_methods")
+                  if rule.get("type") == "required_linear_history":
+                      linear_history = True
               # The live rulesets require it; a template without it would drop it.
               if unattributed is not True:
                   raise SystemExit(f"{path}: require_extra_approval_for_unattributed_changes must be true")
+              # A squash merge lands an ordinary pull request and a merge commit
+              # a sync- or subtree- one; linear history would refuse the latter.
+              if not isinstance(merge_methods, list) or sorted(merge_methods) != ["merge", "squash"]:
+                  raise SystemExit(f"{path}: allowed merge methods must be merge and squash, got {merge_methods!r}")
+              if linear_history:
+                  raise SystemExit(f"{path}: required_linear_history must be absent, since a merge commit cannot satisfy it")
               contexts = [check.get("context") for check in checks]
               landing = ["signed-landing"] if path.name in signed_landing_branches else []
               landing_check = next((check for check in checks if check.get("context") == "signed-landing"), {})
@@ -644,6 +655,12 @@ jobs:
                       f"{path}: strict required status checks policy must be false, got {strict!r}"
                   )
               print(f"{path}: {', '.join(expected)} (branch update not required)")
+          settings_path = Path(".github/repository-settings/merge-methods.json")
+          settings = json.loads(settings_path.read_text(encoding="utf8"))
+          wanted = {"allow_squash_merge": True, "allow_merge_commit": True, "allow_rebase_merge": False}
+          if settings != wanted:
+              raise SystemExit(f"{settings_path}: must be {wanted!r}, got {settings!r}")
+          print(f"{settings_path}: squash merges and merge commits, no rebase merges")
           PY
 
       - name: Check issue template YAML syntax

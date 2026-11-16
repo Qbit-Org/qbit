@@ -45,7 +45,8 @@ release has release candidates is decided per release.
 
 The release source, `TAG_TARGET`, is a reviewed public commit on the
 first-parent history of a protected public branch, usually `RELEASE_BRANCH`:
-normally GitHub's merge commit, not the pull request head
+the commit a pull request landed on the branch (GitHub's squash commit, or for
+a subtree update its merge commit), never a pull request's head
 ([1. Tag](#1-tag)).
 
 Prerequisites for publishing with the publisher:
@@ -231,16 +232,20 @@ Run these on the exact commit you will tag. Any later merge restarts the list.
 
 ### 1. Tag
 
-With merge-commit merges, tag the merge commit that landed the release pull
-request, not the pull request's head. Only the merge commit is a state the
-branch actually had: `0.1.x` and `1.0.0` do not require a pull request to be up
-to date before merging, `main` and `1.x.x` require it only once the Key Policy
-Gate is armed ([after the release](#after-the-release)), and an admin can
-bypass that rule, so a pull request head's tree can lack changes the branch had
-when it merged. The publisher refuses a tag target that is not on the
-first-parent history of `trusted_release_ref`. The release attestation is the
-operator's signature on the annotated tag; the target commit's own signature
-plays no part here.
+Tag the commit that landed the release pull request on the branch: GitHub's
+squash commit, or, where a merge commit landed it, such as a subtree update,
+that merge commit. Never tag a pull request's head. Only the commit on the
+branch is a state the branch actually had: `0.1.x` and `1.0.0` do not require a
+pull request to be up to date before merging, `main` and `1.x.x` require it
+only once the Key Policy Gate is armed ([after the release](#after-the-release)),
+and an admin can bypass that rule, so a pull request head's tree can lack
+changes the branch had when it merged. The publisher refuses a tag target that
+is not on the first-parent history of `trusted_release_ref`: on a history of
+squash commits every commit is on that line and a pull request's head is not,
+and a merge commit's second parent is not on it either. The release
+attestation is the operator's signature on the annotated tag; the target
+commit's own signature plays no part here, and a squash commit carries
+GitHub's.
 
 - [ ] A signer with an active mainnet `release-signing` key signs an
   annotated tag on the exact commit with that key, and checks that the
@@ -471,8 +476,9 @@ examples.
   - [ ] the CI runs at the tag target, any unsigned-platform or codesigning
     waiver, and the review status recorded at the freeze.
 
-  Release-trust records written from now on name GitHub's merge commit as the
-  release source. Earlier records stay as they were written.
+  Release-trust records written from now on name the commit on the branch,
+  GitHub's squash commit, as the release source, never the pull request's
+  head. Earlier records stay as they were written.
 - [ ] Right before the PR merges, check that the release key policy on
   `RELEASE_BRANCH`, `keys.json` and the certificates in `public-keys/`, is
   still the one at `STAGING_REF`; a certificate can change under an

@@ -1109,7 +1109,7 @@ TAG_TARGET="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "$TAG_OBJECT^{commit}
 [ "$(lowercase "$TRUSTED_RELEASE_REF")" != "$(lowercase "$TAG_TARGET")" ] \
     || die "--trusted-release-ref must not equal the release tag target"
 on_first_parent_history "$TRUSTED_ROOT" "$TRUSTED_RELEASE_REF" "$TAG_TARGET" \
-    || die "Release tag target $TAG_TARGET must be on the first-parent history of trusted release ref $TRUSTED_RELEASE_REF: tag the merge commit that landed the release, not the pull request's head"
+    || die "Release tag target $TAG_TARGET must be on the first-parent history of trusted release ref $TRUSTED_RELEASE_REF: tag the commit that landed the release on the branch, not the pull request's head"
 
 GH_REPO_PATH="$(github_repo_path "$GH_REPO")"
 GUIX_SIGS_GH_REPO_PATH="$(github_repo_path "$GUIX_SIGS_GH_REPO")"

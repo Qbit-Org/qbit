@@ -678,8 +678,8 @@ def stage(args: argparse.Namespace) -> int:
                 )
             raise common.ReleaseToolError(
                 f"Release tag {args.tag} target {tag_target} is an ancestor of the trusted release ref"
-                f" {checkout.ref} but not on its first-parent history: tag the merge commit that landed the"
-                " release, not the pull request's head"
+                f" {checkout.ref} but not on its first-parent history: tag the commit that landed the release on"
+                " the branch, not the pull request's head"
             )
         try:
             source_archive = vba.reconstruct_canonical_source_archive(

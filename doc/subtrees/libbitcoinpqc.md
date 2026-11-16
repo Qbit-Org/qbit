@@ -186,8 +186,9 @@ Under the signed-commit policy, `squash-sign` squashes the pull request's
 commits (the import, the pin and test changes, and the release notes) into one
 operator-signed commit. The helper's import is one main-line commit that
 carries the `git-subtree-dir` and `git-subtree-split` trailers, and
-`squash-sign` keeps those trailers, so the lint still passes; that needs one
-touch. See
+`squash-sign` keeps those trailers. GitHub's squash merge then lands that
+commit's message, trailers included, on the branch, so the lint still passes
+there; that needs one touch. See
 [Signed Commits](../development/public-branch-and-rulesets.md#signed-commits).
 
 For a large vendored import, the signature attests the pin, not a line-by-line
@@ -223,8 +224,10 @@ mark the qbit checkout shallow.
 
 The check's search for the newest import commit, described in
 [Refresh The Subtree](#refresh-the-subtree), walks every parent, not only the
-first: with merge-commit merges, the import commit is the merge's second
-parent, so a `--first-parent` search would skip it.
+first. A squash merge lands the import's trailers on the commit it adds to the
+branch, but where a merge commit brings the import in, such as a merge of one
+line into another, the import commit is the merge's second parent, and a
+`--first-parent` search would skip it.
 
 The current qbit tree carries no downstream delta: `HEAD:src/libbitcoinpqc`
 must equal the tagged upstream tree. Since `v0.3.1`, upstream contains the

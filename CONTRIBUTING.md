@@ -45,15 +45,19 @@ Use qbit names and paths in public-facing changes:
 
 Public branches accept only commits with a signature that GitHub verifies. Sign
 your commits with a key registered on your GitHub account; maintainers sign
-their own landing commits with OpenPGP. Each pull request lands as one signed
-commit plus GitHub's merge commit, and its
+the commits they land with OpenPGP. A pull request is first one commit that a
+person signed with an OpenPGP key of their own, and then lands with GitHub's
+squash merge: the branch gains one commit, which GitHub signs, and the commit
+the person signed stays as the pull request's head. GitHub's signature rule is
+satisfied by GitHub's own signature on that commit; the pull request's
 [`signed-landing` check](doc/development/public-branch-and-rulesets.md#signed-landing-check)
-stays red until it is one commit a person signed with an OpenPGP key of their
-own: on most pull requests, until a maintainer has squashed and signed it. A
-standard two-commit update of a subtree inherited from Bitcoin Core
+is what requires the person's, and stays red until the pull request is such a
+commit: on most pull requests, until a maintainer has squashed and signed it.
+A standard two-commit update of a subtree inherited from Bitcoin Core
 (`src/leveldb`, `src/secp256k1`, `src/crc32c`, `src/minisketch`,
-`src/crypto/ctaes` or `src/ipc/libmultiprocess`) keeps both of its commits and
-is opened from a `subtree-<name>` branch, which the check lets merge as it is; a
+`src/crypto/ctaes` or `src/ipc/libmultiprocess`) keeps both of its commits: it
+is opened from a `subtree-<name>` branch, which the check lets merge as it is,
+and lands with a merge commit, so both of its commits must already be signed; a
 `src/libbitcoinpqc` import is one commit, as
 [the libbitcoinpqc runbook](doc/subtrees/libbitcoinpqc.md) describes. A pull request
 from a branch in this repository lands through `squash-sign`, as described in
@@ -62,7 +66,7 @@ A pull request from a fork lands as follows:
 
 - If your pull request is a single commit signed with an OpenPGP key on your
   own GitHub account (not a commit made in GitHub's web UI), a maintainer
-  merges it as it is. The check tells a person's OpenPGP signature from
+  squash-merges it as it is. The check tells a person's OpenPGP signature from
   GitHub's own, and does not read SSH or S/MIME signatures.
 - If it has an unsigned commit, a commit signed with an SSH key or an S/MIME
   certificate, or more than one commit, a maintainer recreates it from a branch
