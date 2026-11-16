@@ -1095,6 +1095,83 @@ class BranchRulesetStepTest(unittest.TestCase):
                 self.edit_json(rulesets / name, lambda data: data["rules"].append({"type": "required_linear_history"}))
                 self.assert_step_fails(rulesets, "required_linear_history must be absent")
 
+    def test_no_branch_ruleset_requires_signed_landing(self) -> None:
+        for name in ("main.json", "1.x.x.json", "1.0.0.json", "0.1.x.json"):
+            with self.subTest(template=name), tempfile.TemporaryDirectory() as tmp:
+                rulesets = self.copy_rulesets(Path(tmp))
+
+                def add(data):
+                    for rule in data["rules"]:
+                        if rule["type"] == "required_status_checks":
+                            rule["parameters"]["required_status_checks"].append(
+                                {"context": "signed-landing", "integration_id": 15368}
+                            )
+
+                self.edit_json(rulesets / name, add)
+                self.assert_step_fails(rulesets, "required status checks must be")
+
+    def test_required_checks_holds_signed_landing_where_nobody_can_bypass_it(self) -> None:
+        def rule(data, kind):
+            return next(r for r in data["rules"] if r["type"] == kind)
+
+        def checks(value):
+            return lambda data: rule(data, "required_status_checks")["parameters"].__setitem__(
+                "required_status_checks", value
+            )
+
+        def pull_request(key, value):
+            return lambda data: rule(data, "pull_request")["parameters"].__setitem__(key, value)
+
+        def status(key, value):
+            return lambda data: rule(data, "required_status_checks")["parameters"].__setitem__(key, value)
+
+        def include(value):
+            return lambda data: data["conditions"]["ref_name"].__setitem__("include", value)
+
+        admin = {"actor_id": None, "actor_type": "OrganizationAdmin", "bypass_mode": "always"}
+        cases = {
+            "an admin bypass": (lambda data: data.__setitem__("bypass_actors", [admin]), "bypass_actors must be empty"),
+            "a pull request bypass": (
+                lambda data: data.__setitem__("bypass_actors", [dict(admin, bypass_mode="pull_request")]),
+                "bypass_actors must be empty",
+            ),
+            "no bypass_actors key": (lambda data: data.pop("bypass_actors"), "bypass_actors must be empty"),
+            "evaluate enforcement": (lambda data: data.__setitem__("enforcement", "evaluate"), "must be the active"),
+            "another name": (lambda data: data.__setitem__("name", "signed-landing"), "must be the active"),
+            "a check from any app": (checks([{"context": "signed-landing"}]), "exactly signed-landing"),
+            "a check from another app": (
+                checks([{"context": "signed-landing", "integration_id": 1}]), "exactly signed-landing"
+            ),
+            "a second check": (
+                checks([{"context": "signed-landing", "integration_id": 15368}, {"context": "Required Merge Gate"}]),
+                "exactly signed-landing",
+            ),
+            "no check": (checks([]), "exactly signed-landing"),
+            "a strict check": (status("strict_required_status_checks_policy", True), "must not be strict"),
+            "enforced on creation": (status("do_not_enforce_on_create", False), "must not be strict"),
+            "without 0.1.x": (include(["refs/heads/1.x.x", "refs/heads/1.0.0"]), "must target exactly"),
+            "with main": (
+                include(["refs/heads/1.x.x", "refs/heads/1.0.0", "refs/heads/0.1.x", "refs/heads/main"]),
+                "must target exactly",
+            ),
+            "an exclusion": (
+                lambda data: data["conditions"]["ref_name"].__setitem__("exclude", ["refs/heads/0.1.x"]),
+                "must target exactly",
+            ),
+            "no pull request rule": (
+                lambda data: data.__setitem__("rules", [rule(data, "required_status_checks")]),
+                "rules must be exactly",
+            ),
+            "a third rule": (lambda data: data["rules"].append({"type": "deletion"}), "rules must be exactly"),
+            "one approval": (pull_request("required_approving_review_count", 1), "must require no approval"),
+            "squash only": (pull_request("allowed_merge_methods", ["squash"]), "allowed merge methods"),
+        }
+        for case, (edit, message) in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                rulesets = self.copy_rulesets(Path(tmp))
+                self.edit_json(rulesets / "required-checks.json", edit)
+                self.assert_step_fails(rulesets, message)
+
     def test_the_merge_method_settings_must_allow_squash_and_merge_only(self) -> None:
         for key, value in (
             ("allow_squash_merge", False),

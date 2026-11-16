@@ -54,10 +54,11 @@ document describes the repository after the operator applies these templates.
 | Template | Target | Baseline behavior |
 | --- | --- | --- |
 | `.github/rulesets/main.json` | `refs/heads/main` | Require pull requests, one approval, resolved conversations, the squash and merge-commit merge methods, `Required Merge Gate` and `Key Policy Gate (main)` (GitHub Actions, integration 15368), code-owner review, block deletion, and block non-fast-forward updates. Require the branch to be up to date before merging. |
-| `.github/rulesets/0.1.x.json` | `refs/heads/0.1.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, the squash and merge-commit merge methods, `Required Merge Gate` and `signed-landing` (GitHub Actions, integration 15368), block deletion, and block non-fast-forward updates. Do not require the branch to be up to date before merging. |
-| `.github/rulesets/1.0.0.json` | `refs/heads/1.0.0` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, the squash and merge-commit merge methods, `Required Merge Gate` and `signed-landing` (GitHub Actions, integration 15368), block deletion, and block non-fast-forward updates. Do not require the branch to be up to date before merging. |
-| `.github/rulesets/1.x.x.json` | `refs/heads/1.x.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, the squash and merge-commit merge methods, `Required Merge Gate`, `Key Policy Gate (1.x.x)` and `signed-landing` (both GitHub Actions, integration 15368), code-owner review, block deletion, and block non-fast-forward updates. Require the branch to be up to date before merging. |
+| `.github/rulesets/0.1.x.json` | `refs/heads/0.1.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, the squash and merge-commit merge methods, `Required Merge Gate`, block deletion, and block non-fast-forward updates. Do not require the branch to be up to date before merging. |
+| `.github/rulesets/1.0.0.json` | `refs/heads/1.0.0` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, the squash and merge-commit merge methods, `Required Merge Gate`, block deletion, and block non-fast-forward updates. Do not require the branch to be up to date before merging. |
+| `.github/rulesets/1.x.x.json` | `refs/heads/1.x.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, the squash and merge-commit merge methods, `Required Merge Gate` and `Key Policy Gate (1.x.x)` (GitHub Actions, integration 15368), code-owner review, block deletion, and block non-fast-forward updates. Require the branch to be up to date before merging. |
 | `.github/rulesets/signed-commits.json` | `refs/heads/main`, `refs/heads/0.1.x`, `refs/heads/1.0.0`, `refs/heads/1.1.0`, `refs/heads/1.x.x` | Require a verified signature on every commit pushed to these branches, with no bypass actors. See [Signed Commits](#signed-commits). |
+| `.github/rulesets/required-checks.json` | `refs/heads/1.x.x`, `refs/heads/1.0.0`, `refs/heads/0.1.x` | Require `signed-landing` (GitHub Actions, integration 15368), not strict and not enforced when a branch is created, and pull requests with the squash and merge-commit merge methods and no approval, with no bypass actors. Applied last; see [Signed Landing Check](#signed-landing-check). |
 | `.github/rulesets/release-tags-v-creation.json` | `refs/tags/v*` | Restrict tag creation to organization admins and the release-maintainers team. |
 | `.github/rulesets/release-tags-v-immutability.json` | `refs/tags/v*` | Restrict tag updates and deletion to organization admins only. |
 | `.github/rulesets/upstream-refs.json` | `refs/heads/upstream/**` | Lock optional upstream reference branches so only bypass actors can create, update, or delete them. |
@@ -108,10 +109,11 @@ one lands a given pull request is process: a merge commit for a `sync-` or
 rebase merges: the signature rule refuses them.
 
 Templates that restrict ref creation, update, or deletion use
-`OrganizationAdmin` as the portable bypass actor. The `v*` tag creation template
-also includes a `Team` bypass actor for the release-maintainers team. GitHub
-rulesets require the numeric team ID as `actor_id`; the current public
-`release-maintainers` team ID is `18321137`.
+`OrganizationAdmin` as the portable bypass actor, except `signed-commits.json`
+and `required-checks.json`, which have no bypass actors, so that they bind
+admins too. The `v*` tag creation template also includes a `Team` bypass actor
+for the release-maintainers team. GitHub rulesets require the numeric team ID
+as `actor_id`; the current public `release-maintainers` team ID is `18321137`.
 
 The `v*` tag immutability template intentionally does not include the
 release-maintainers team. Release maintainers can create release tags, but only
@@ -257,7 +259,8 @@ repository allow, so merges never freeze:
    merge commits enabled for now.
 3. Edit each branch ruleset (`main`, `0.1.x`, `1.0.0`, and `1.x.x`): set the
    allowed merge methods to Squash and Rebase, and tick "Require linear
-   history".
+   history". `required-checks`, if it is live, stays as it is: it allows
+   squash merges too.
 4. Untick **Allow merge commits**.
 5. Verify the rolled-back state with the assertions below. Set `signatures` to
    `active` if you skipped step 1, or to `disabled` if you ran it. A non-zero
@@ -454,19 +457,20 @@ the exact conditions:
   deployments, code scanning, or a merge queue applies.
 - `squash-sign verify` passes.
 
-So for qbit the flag is refused for a squash merge until `signed-landing` is
-required here through a ruleset the caller cannot bypass: until then an
-ordinary pull request lands with its approvals or by the operator's own merge.
-Arming the check in the order [Signed Landing Check](#signed-landing-check)
-gives is not enough on its own, because the branch rulesets that require it
-keep their `OrganizationAdmin` bypass, and squash-sign runs with an
-organization admin's credentials.
+So for qbit the flag works for a squash merge into `0.1.x`, `1.0.0` and
+`1.x.x` once `required-checks.json` is live, under the conditions above: that
+ruleset requires `signed-landing` there and has no bypass actors. Until then,
+and into `main` or `1.1.0`, which do not require the check, the flag is refused
+for a squash merge, and an ordinary pull request lands with its approvals or
+by the operator's own merge.
 
-Agents never run plain `gh pr merge --admin`: it skips all of these checks,
-because `OrganizationAdmin` bypasses the branch rulesets. The `signed-commits`
-ruleset has no bypass actors, so GitHub still refuses an unsigned commit that a
-merge commit would add, even for admins, but accepts a squash merge of any pull
-request, because it signs the squash commit itself.
+Agents never run plain `gh pr merge --admin`: it skips every check above that
+the branch rulesets hold, because `OrganizationAdmin` bypasses them. Only the
+rulesets with no bypass actors still bind admins. Under `signed-commits`, GitHub refuses
+an unsigned commit that a merge commit would add, even for admins, but accepts
+a squash merge of any pull request, because it signs the squash commit itself.
+On `0.1.x`, `1.0.0` and `1.x.x`, once `required-checks` is live, it still
+requires `signed-landing`.
 
 The rule accepts any commit that GitHub marks Verified. GitHub signs only
 commits it creates itself through its API or web UI: the squash and merge
@@ -492,7 +496,12 @@ break-glass that lifts the rule on that branch only:
 1. An organization admin edits the `signed-commits` ruleset and removes only the
    target branch's ref from its `include` list. Enforcement stays `active` on
    every other branch.
-2. The admin pushes the import to that branch.
+2. The admin lands the import on that branch. Into `0.1.x`, `1.0.0` or
+   `1.x.x`, once `required-checks` is live, a direct push is refused, admins
+   included, so the import goes through a pull request from a `subtree-`
+   branch, which the [`signed-landing` check](#signed-landing-check) lets merge
+   as it is, with a merge commit. Into `main` or `1.1.0`, whose rulesets an
+   organization admin can bypass, the admin may still push it.
 3. The admin adds the ref back to the `include` list immediately.
 4. The admin runs the step 5 assertions in
    [Switching the Merge Methods](#switching-the-merge-methods), which must pass
@@ -544,32 +553,36 @@ in this order:
 2. An Actions event policy allows `pull_request_target` for
    `.github/workflows/signed-landing.yml`; GitHub blocks that event in public
    repositories otherwise.
-3. Only then do the `0.1.x`, `1.0.0` and `1.x.x` rulesets require
-   `signed-landing` from GitHub Actions (integration 15368), as
-   `.github/rulesets/` describes. `main.json` does not require it.
+3. Only then is `.github/rulesets/required-checks.json` applied, the last of
+   the templates, which requires `signed-landing` from GitHub Actions
+   (integration 15368) on `0.1.x`, `1.0.0` and `1.x.x`. `main` does not
+   require it.
 
 No ruleset may require it earlier: until then no run reports the check, and
-every pull request into those branches would wait for it forever. Until step
-3, leave `signed-landing` out when you bring a live ruleset in line with its
-template. A pull request that is already open gets a run only on its next
-event, so after step 3 push to, edit or reopen each one that shows the check
-as expected but missing.
+every pull request into those branches would wait for it forever. A pull
+request that is already open gets a run only on its next event, so after step
+3 push to, edit or reopen each one that shows the check as expected but
+missing.
 
-Organization admins can bypass the check on these branches. It is a rule of
-the branch rulesets, and qbit's branch rulesets keep their `OrganizationAdmin`
-bypass for the release move of `main` and the break-glass import above. The
-other Qbit-Org repositories hold the check in a ruleset nobody can bypass; qbit
-does not, so `squash-sign merge --admin-approvals` refuses `--admin` for a
-squash merge into these branches (see [Signed Commits](#signed-commits)): an
-ordinary pull request lands with its approvals or by the operator's own
-merge.
+Nobody can bypass the check on these branches, organization admins
+included: as in the other Qbit-Org repositories, `required-checks.json` has no
+bypass actors. Its `pull_request` rule is there because a check's result
+belongs to a commit: without it, an admin could push to one of these branches a
+commit that passed as the head of a pull request into another branch. It
+requires no approval; approvals stay in the branch rulesets, which keep their
+`OrganizationAdmin` bypass. Once it is live, a direct push to `0.1.x`,
+`1.0.0` or `1.x.x` is refused, admins included, so the break-glass import
+above goes through a pull request, and `squash-sign merge --admin-approvals`
+can bypass the approval requirement for a squash merge into these branches
+(see [Signed Commits](#signed-commits)). The release move of `main` is
+unchanged: `main` does not require the check.
 
 ## Operational Notes
 
 The switch of merge methods and the `signed-commits` ruleset leave the existing
 required status checks unchanged, and `signed-commits.json` adds no status
-checks. The `0.1.x`, `1.0.0` and `1.x.x` templates add `signed-landing`, which
-a ruleset requires only in the order given in
+checks. `required-checks.json` adds `signed-landing` on `0.1.x`, `1.0.0` and
+`1.x.x`, applied only in the order given in
 [Signed Landing Check](#signed-landing-check).
 
 Required status checks are encoded as the aggregate `Required Merge Gate`; on
@@ -577,8 +590,8 @@ Required status checks are encoded as the aggregate `Required Merge Gate`; on
 the base-only key-policy check (`.github/workflows/key-policy-gate.yml`, see
 `contrib/keys/README.md`). Require the gate only once `main` holds the
 workflow and an Actions event policy allows `pull_request_target` for it; the
-README gives the order. On `0.1.x`, `1.0.0` and `1.x.x` they also include
-`signed-landing`, which follows the same kind of order
+README gives the order. On `0.1.x`, `1.0.0` and `1.x.x`, `required-checks.json`
+also requires `signed-landing`, which follows the same kind of order
 ([Signed Landing Check](#signed-landing-check)).
 Do not protect public branches with the raw `Core Checks Gate` or
 `Full Validation Gate` checks. Those checks are inputs to the required gate, and
@@ -595,7 +608,7 @@ The required merge gate has five validation profiles:
 | Release-policy validation | Pull requests whose changed paths are only release policy or trusted release reference files. | Run `git diff --check`, release publisher and validator tests for touched publication or validator files, `bash -n` for publisher changes, and operator key metadata validation when operator keys are touched. |
 | RPC docs validation | Pull requests whose changed paths are only RPC documentation pipeline files. | Run `git diff --check`, RPC docs unit tests, and require the existing `rpc-docs` build check. |
 | Public docs validation | Pull requests whose changed paths are only public-facing documentation and release notes. | Run `git diff --check` and require the existing `public-docs-lint` check. |
-| GitHub metadata validation | Pull requests whose changed paths are only public ruleset templates, repository settings, issue/PR templates, and the docs that explain those settings. | Run `git diff --check`, parse ruleset and repository-settings JSON, assert the public branch rulesets' required checks (`Required Merge Gate`; `Key Policy Gate (main)` or `Key Policy Gate (1.x.x)` with code-owner review on `main` and `1.x.x`; and `signed-landing` on `0.1.x`, `1.0.0` and `1.x.x`), their merge methods (squash and merge commit, no linear history), extra approval for unattributed changes, and the merge-method settings (squash merges and merge commits, no rebase merges), and best-effort parse issue template YAML when PyYAML is available. |
+| GitHub metadata validation | Pull requests whose changed paths are only public ruleset templates, repository settings, issue/PR templates, and the docs that explain those settings. | Run `git diff --check`, parse ruleset and repository-settings JSON, assert the public branch rulesets' required checks (`Required Merge Gate`; `Key Policy Gate (main)` or `Key Policy Gate (1.x.x)` with code-owner review on `main` and `1.x.x`), that `signed-landing` is required only by `required-checks.json`, on exactly `0.1.x`, `1.0.0` and `1.x.x`, from GitHub Actions, with no bypass actors and no approval, their merge methods (squash and merge commit, no linear history), extra approval for unattributed changes, and the merge-method settings (squash merges and merge commits, no rebase merges), and best-effort parse issue template YAML when PyYAML is available. |
 
 The lightweight profiles are intentionally narrow. The release-policy allowlist
 is:
