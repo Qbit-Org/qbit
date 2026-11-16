@@ -1,8 +1,19 @@
 # Required check: a pull request is ready to land only as one commit that a
 # person signed with an OpenPGP key of their own. GitHub's signature rule also
 # accepts commits GitHub signs itself (web edits, "Update branch" merges,
-# bots), so this check tells them apart. A branch listed in AS_IS_HEADS merges
-# as it is instead, and is not judged.
+# bots), so this check tells them apart.
+#
+# A branch of this repository that matches AS_IS_HEADS (patterns) merges as it
+# is, with any number of commits, when its head commit is signed by a person:
+# that signature covers everything the head brings. The check judges it itself,
+# because GitHub signs a squash merge whatever the commits were, and anyone who
+# can push can create a branch of any name at any commit. A branch named in
+# AS_IS_LINES (exact names, no patterns) merges as it is when GitHub's rules
+# for it require this check on every pull request into it and restrict who can
+# create, delete or force-push it; otherwise its head commit decides, as for
+# AS_IS_HEADS. It needs the rule on creation because GitHub has rules for a
+# branch that doesn't exist yet, and a branch can be created at any commit
+# already in the repository. A fork's branch never merges as it is.
 #
 # It always runs from the default branch's copy of this file
 # (pull_request_target), whatever branch the pull request targets, so a pull
@@ -56,6 +67,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           AS_IS_HEADS: "sync-* subtree-*"
+          AS_IS_LINES: ""
         run: |
           python3 - <<'PY'
           import base64
@@ -90,6 +102,10 @@ jobs:
           RUN_TITLE = re.compile(r"signed-landing #([1-9]\d{0,9}) (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) (open|closed) (true|false) ([^ ]+) "
                                  r"([0-9a-f]{40})")
           HOW = "A maintainer squashes the pull request into one commit, signs it and pushes it before merging."
+          CHECK = "signed-landing"   # this check's name: the job's name, which a ruleset requires
+          CHECK_APP = 15368          # GitHub Actions, the app that reports it: the integration_id a ruleset pins it to
+          AS_IS_HOW = ("A maintainer puts a commit they sign on top of the branch and pushes it. For a sync or a back-merge, "
+                       "that is the merge commit itself, made and signed by the maintainer.")
 
 
           class NotReady(Exception):
@@ -221,8 +237,76 @@ jobs:
               return False
 
 
-          def judge(pr, commits, as_is_heads, event_head, keys_of):
-              """A sentence saying why the pull request may land. Raises NotReady or Unknown."""
+          def line_gaps(rules):
+              """What GitHub's rules for a line lack before it can gain commits only through pull requests this check
+              passed, and can't be created, or deleted and made again, at another commit: as sentences, none when they
+              lack nothing. `rules` is GitHub's answer for the branch, all pages of it. GitHub answers for a branch that
+              doesn't exist too, and anyone who can push can create a branch at any commit already in the repository,
+              unless a rule restricts who can create it."""
+              if not isinstance(rules, list) or not all(isinstance(rule, dict) and isinstance(rule.get("type"), str)
+                                                        for rule in rules):
+                  raise Unknown("GitHub's list of the rules for the pull request's branch has an unexpected shape")
+              kinds, checked = {rule["type"] for rule in rules}, False
+              for rule in rules:
+                  if rule["type"] == "required_status_checks":
+                      parameters = rule.get("parameters")
+                      required = parameters.get("required_status_checks") if isinstance(parameters, dict) else None
+                      if not isinstance(required, list) or not all(isinstance(check, dict) and isinstance(check.get("context"), str)
+                                                                   for check in required):
+                          raise Unknown("GitHub's list of the rules for the pull request's branch has a rule of required checks "
+                                        "with an unexpected shape")
+                      # Required from no app in particular, a commit status of this name, which anyone who can push can set,
+                      # would meet the rule. So would a check another app reports.
+                      checked = checked or any(check["context"] == CHECK and type(check.get("integration_id")) is int
+                                               and check["integration_id"] == CHECK_APP for check in required)
+              gaps = [] if checked else [f"no rule requires this check, {CHECK}, from GitHub Actions"]
+              for kind, gap in (("pull_request", "no rule requires a pull request to change it"),
+                                ("deletion", "no rule keeps it from being deleted"),
+                                ("non_fast_forward", "no rule keeps it from being force-pushed"),
+                                ("creation", "no rule restricts who can create it")):
+                  if kind not in kinds:
+                      gaps.append(gap)
+              return gaps
+
+
+          def unread(_):
+              raise Unknown("this check was given no way to read GitHub's answer for the head commit or the branch's rules")
+
+
+          def judge_as_is(head_ref, head_sha, count, listed, keys_of, head_commit, line_rules):
+              """judge() for a branch of this repository that merges as it is (`listed`: one of AS_IS_LINES).
+
+              A listed line passes when GitHub's rules for it require this check on every pull request into it and
+              restrict who can create, delete or force-push it: it gains commits only through pull requests this check
+              passed, and nobody can make it, or make it again, at another commit. Otherwise its head commit, read by itself, has to be signed
+              by a person, as for a branch matching AS_IS_HEADS: the signature covers the commit's tree and parents, so
+              the person who signed it answers for everything it brings, however many commits that is."""
+              gaps = line_gaps(line_rules(head_ref)) if listed else []
+              if listed and not gaps:
+                  return (f"`{head_ref}` merges as it is: GitHub's rules for it require this check on every pull request into "
+                          "it, and it can't be created, deleted or force-pushed outside those rules, so it gains commits only "
+                          "through pull requests this check passed.")
+              commit = head_commit(head_sha)
+              if not isinstance(commit, dict) or commit.get("sha") != head_sha:
+                  raise Unknown(f"GitHub's answer for the head commit {head_sha[:12]} is not an answer for that commit")
+              problem = signer_problem(commit, keys_of)
+              if problem is None:
+                  return (f"`{head_ref}` merges as it is, and its head commit {head_sha[:12]} is signed by a person, who "
+                          f"answers for the {count} commit(s) it brings.")
+              if gaps:
+                  # The way out is the rules: a line can't take a maintainer's signed commit by a push once it requires
+                  # pull requests.
+                  raise NotReady(f"`{head_ref}` is listed in the workflow as a line that merges as it is, but GitHub's rules "
+                                 f"for it don't show that it gains commits only through pull requests this check passed: "
+                                 f"{'; '.join(gaps)}. An admin adds the missing rules for `{head_ref}`. Until then its head "
+                                 f"commit has to be signed by a person, and {head_sha[:12]} can't land: {problem}.")
+              raise NotReady(f"`{head_ref}` merges as it is, so its head commit has to be signed by a person, who then answers "
+                             f"for everything it brings, and {head_sha[:12]} can't land: {problem}. {AS_IS_HOW}")
+
+
+          def judge(pr, commits, as_is_heads, event_head, keys_of, as_is_lines=(), head_commit=unread, line_rules=unread):
+              """A sentence saying why the pull request may land. Raises NotReady or Unknown. `head_commit(sha)` and
+              `line_rules(branch)` are GitHub's answers for a commit and for the rules of a branch."""
               try:
                   head, base = pr["head"], pr["base"]
                   head_ref, head_sha, count = head["ref"], head["sha"], pr["commits"]
@@ -237,9 +321,9 @@ jobs:
                   raise Behind(f"GitHub reports {head_sha[:12]} as the pull request's head, and this run is for "
                                f"{event_head[:12]}. If the pull request has moved on, the run for its new head decides. "
                                "If not, re-run this check")
-              if same_repo and merges_as_is(head_ref, as_is_heads):
-                  return (f"`{head_ref}` is a branch that merges as it is, so this check doesn't judge its {count} "
-                          "commit(s). GitHub's signature rule still requires each of them to be verified.")
+              if same_repo and (head_ref in as_is_lines or merges_as_is(head_ref, as_is_heads)):
+                  # A fork's branch is never one of these: anyone can name a branch anything there.
+                  return judge_as_is(head_ref, head_sha, count, head_ref in as_is_lines, keys_of, head_commit, line_rules)
               if count != 1:
                   listed = ([commit.get("sha") for commit in commits]
                             if isinstance(commits, list) and all(isinstance(commit, dict) for commit in commits) else None)
@@ -271,7 +355,8 @@ jobs:
               return f"One commit, {head_sha[:12]}, signed by a person."
 
 
-          def judge_all(pr, commits, others, as_is_heads, event_head, keys_of):
+          def judge_all(pr, commits, others, as_is_heads, event_head, keys_of, as_is_lines=(), head_commit=unread,
+                        line_rules=unread):
               """judge() for this pull request, then for every other pull request that could merge
               the same head commit (`others`: their (pull request, commits) answers). The result is a
               check on the commit, and a ruleset matches it by name alone: a pass earned against
@@ -286,10 +371,10 @@ jobs:
                   verdict = ("This pull request can't merge this commit as it is (it is closed, a draft, or on another commit), "
                              "and every other open pull request with this head commit may land.")
               else:
-                  verdict = judge(pr, commits, as_is_heads, event_head, keys_of)
+                  verdict = judge(pr, commits, as_is_heads, event_head, keys_of, as_is_lines, head_commit, line_rules)
               for other, other_commits in others:
                   try:
-                      judge(other, other_commits, as_is_heads, event_head, keys_of)
+                      judge(other, other_commits, as_is_heads, event_head, keys_of, as_is_lines, head_commit, line_rules)
                   except NotReady as exc:
                       number = other.get("number") if isinstance(other, dict) else None
                       raise NotReady(f"Pull request #{number} has the same head commit and can't land. {exc} This check "
@@ -342,6 +427,21 @@ jobs:
                              if isinstance(e, dict) and isinstance(e.get("key_id"), str)
                              and e.get("revoked") is not True and e.get("can_sign") is not False)
               return ids
+
+
+          def branch_rules(repo, branch, token, deadline):
+              """Every active rule GitHub applies to a branch of the repository, read to the last page. line_gaps()
+              reads the answer."""
+              rules = []
+              for page in range(1, PAGES + 1):
+                  found = fetch(f"/repos/{repo}/rules/branches/{urllib.parse.quote(branch, safe='')}?per_page={LISTED}&page={page}",
+                                token, deadline)
+                  if not isinstance(found, list):
+                      raise Unknown(f"GitHub's list of the rules for `{branch}` has an unexpected shape")
+                  rules += found
+                  if len(found) < LISTED:
+                      return rules
+              raise Unknown(f"GitHub lists too many rules for `{branch}` to read them all")
 
 
           def open_heads(repo, sha, token, deadline):
@@ -548,13 +648,32 @@ jobs:
                         "and GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT by the runner")
                   return 1
               as_is_heads = os.environ.get("AS_IS_HEADS", "").split()
+              as_is_lines = os.environ.get("AS_IS_LINES", "").split()
+              patterned = [line for line in as_is_lines if set(line) & set("*?[")]
+              if patterned:
+                  print(f"::error title=signed-landing::AS_IS_LINES in this workflow lists {' '.join(patterned)}, and it takes "
+                        "exact branch names only: with a pattern, anyone who can push could create a branch with a matching "
+                        "name at any commit and have it merge as it is. A maintainer corrects the list in the default "
+                        "branch's copy of the workflow, and every pull request fails this check until then.")
+                  return 1
               deadline = time.monotonic() + 120
-              known = {}
+              known, heads, lines = {}, {}, {}
 
               def keys_of(login):                       # one read for each committer, however many pull requests are judged
                   if login not in known:
                       known[login] = committer_keys(login, token, deadline)
                   return known[login]
+
+              def head_commit(sha):                     # likewise, the head commit read by itself
+                  if sha not in heads:
+                      # per_page=1: the commit is wanted, not the list of the files it changes.
+                      heads[sha] = fetch(f"/repos/{repo}/commits/{sha}?per_page=1", token, deadline)
+                  return heads[sha]
+
+              def line_rules(branch):                   # and the rules of each branch
+                  if branch not in lines:
+                      lines[branch] = branch_rules(repo, branch, token, deadline)
+                  return lines[branch]
 
               try:
                   while True:
@@ -568,7 +687,8 @@ jobs:
                               count_settled(repo, pr, event_head, token, deadline)
                           commits = fetch(f"/repos/{repo}/pulls/{number}/commits?per_page={LISTED}", token, deadline)
                           others = sharing(repo, int(number), event_head, seen, token, deadline)
-                          print(judge_all(pr, commits, others, as_is_heads, event_head, keys_of))
+                          print(judge_all(pr, commits, others, as_is_heads, event_head, keys_of, as_is_lines, head_commit,
+                                          line_rules))
                           return 0
                       except Behind:
                           # This is the only run for this commit, so give GitHub's reads time to catch up

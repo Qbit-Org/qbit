@@ -87,8 +87,12 @@ with an OpenPGP key of their own.
 
 Two kinds of pull request land as they are, with a merge commit: a merge of
 one line into another, from a `sync-` branch, and the standard two-commit
-subtree update, from a `subtree-` branch. For a merge commit GitHub's
-signature rule checks every commit the merge adds to the branch, and refuses
+subtree update, from a `subtree-` branch. The check passes them with any
+number of commits, but only when the head commit is signed by a person with an
+OpenPGP key on their own GitHub account: that signature covers the commit's
+tree and its parents, so the person who signed the head answers for everything
+the pull request brings. For a merge commit GitHub's signature rule checks
+every commit the merge adds to the branch, and refuses
 an unsigned one even for an admin merging with `--admin` ("Repository rule
 violations found. Commits must have verified signatures."), so their commits
 must already be signed. The rule also refuses rebase merges, because GitHub
@@ -391,15 +395,23 @@ the update needs two touches:
    2.43, lacks it and fails with `unknown switch S`; upgrade Git if it is
    missing.
 2. Run `git subtree pull --squash -S --prefix=<prefix> <repository> <ref>`.
+   If the merge stops on a conflict, resolve it and finish it with
+   `git commit -S`.
 3. Confirm that both new commits are signed with `git log --show-signature -2`.
 
 `git subtree` makes the squash commit with `git commit-tree`, which ignores
 `commit.gpgsign`, so without `-S` that commit is created unsigned and no error
 is shown. The update lands as it is, with a merge commit, through
 `squash-sign merge --keep-commits`, which accepts it only when a person's
-OpenPGP key signed both commits. Open it from
-a `subtree-<name>` branch, such as `subtree-leveldb`, so that the
-[`signed-landing` check](#signed-landing-check) lets it merge as it is.
+OpenPGP key signed both commits. Open it from a `subtree-<name>` branch, where
+`<name>` is the subtree's directory name, such as `subtree-leveldb`, or
+`subtree-ctaes` for `src/crypto/ctaes`. The
+[`signed-landing` check](#signed-landing-check) then lets it merge as it is
+when its head commit, the subtree merge from step 2, is signed by a person.
+Push the branch as step 2 left it. Do not update it with GitHub's "Update
+branch" button: GitHub makes and signs that merge commit, and the check refuses
+a head commit GitHub made. If the branch has to catch up with its base, run the
+update again from the new base.
 
 Contributors sign their own commits with a key registered on their GitHub
 account. A fork pull request lands as it is only when that key is an OpenPGP
@@ -499,9 +511,13 @@ break-glass that lifts the rule on that branch only:
 2. The admin lands the import on that branch. Into `0.1.x`, `1.0.0` or
    `1.x.x`, once `required-checks` is live, a direct push is refused, admins
    included, so the import goes through a pull request from a `subtree-`
-   branch, which the [`signed-landing` check](#signed-landing-check) lets merge
-   as it is, with a merge commit. Into `main` or `1.1.0`, whose rulesets an
-   organization admin can bypass, the admin may still push it.
+   branch, which merges as it is, with a merge commit. The
+   [`signed-landing` check](#signed-landing-check) judges its head commit, so
+   the branch's last commit is one the admin makes and signs, such as the
+   merge that brings the imported history in (`git merge -S`); the admin's
+   signature then answers for the history it brings. Into `main` or `1.1.0`,
+   whose rulesets an organization admin can bypass, the admin may still push
+   it.
 3. The admin adds the ref back to the `include` list immediately.
 4. The admin runs the step 5 assertions in
    [Switching the Merge Methods](#switching-the-merge-methods), which must pass
@@ -513,12 +529,14 @@ break-glass that lifts the rule on that branch only:
 ## Signed Landing Check
 
 `.github/workflows/signed-landing.yml` reports a check named `signed-landing`.
-It passes only when a pull request is one commit that a person signed with an
-OpenPGP key on their own GitHub account. The signature rule cannot tell that by
-itself, because it also accepts commits GitHub signs: squash merges, web edits,
-"Update branch" merges and bots. An ordinary pull request lands with GitHub's
-squash merge, so the commit on the branch carries GitHub's signature, and this
-check is what requires the person's, on the pull request's head. So on an open
+It passes an ordinary pull request only when it is one commit that a person
+signed with an OpenPGP key on their own GitHub account, and a pull request that
+merges as it is (below) only when its head commit is signed that way. The
+signature rule cannot tell that by itself, because it also accepts commits
+GitHub signs: squash merges, web edits, "Update branch" merges and bots. An
+ordinary pull request lands with GitHub's squash merge, so the commit on the
+branch carries GitHub's signature, and this check is what requires the
+person's, on the pull request's head. So on an open
 pull request the check is red until a maintainer has squashed and signed it
 with `squash-sign apply`; that is expected, not a failure. Its result belongs to
 the head commit, so it passes only if every open pull request with that head
@@ -529,17 +547,42 @@ other Qbit-Org repositories describe how a pull request lands; in qbit, this
 document does.
 
 `AS_IS_HEADS` in the workflow lists the head branches whose pull requests merge
-as they are and are not judged: `sync-*` and `subtree-*`. A pattern matches one
-path segment at a time, and only a branch in this repository, never a fork's:
+as they are, with a merge commit and any number of commits: `sync-*` and
+`subtree-*`. A pattern matches one path segment at a time, so a `*` never
+matches a `/`, and it matches only a branch in this repository: a fork's
+pull request is judged as an ordinary one, whatever its branch is called.
 
 | Head branch | Use |
 | --- | --- |
-| `sync-<from>-into-<to>`, such as `sync-main-into-1.x.x` | A merge of one line into another, which lands as it is with a merge commit and keeps the commits it brings in. A pull request whose head is the line itself, such as `1.x.x`, does not match, so open the merge from a `sync-` branch. |
-| `subtree-<name>`, such as `subtree-leveldb` | The standard two-commit subtree update (see [Signed Commits](#signed-commits)), which lands as it is with a merge commit through `squash-sign merge --keep-commits`. |
+| `sync-<from>-into-<to>`, such as `sync-main-into-1.x.x` | A merge of one line into another, which lands as it is with a merge commit and keeps the commits it brings in. Its head commit is the merge itself, which the maintainer makes and signs. A pull request whose head is the line itself, such as `1.x.x`, does not match, so open the merge from a `sync-` branch. |
+| `subtree-<name>`, such as `subtree-leveldb` | The standard two-commit subtree update (see [Signed Commits](#signed-commits)), which lands as it is with a merge commit through `squash-sign merge --keep-commits`. `<name>` is the subtree's directory name, so `subtree-ctaes` for `src/crypto/ctaes`: `subtree-crypto/ctaes` matches no pattern. Its head commit is the subtree merge, which `git subtree pull -S` makes and signs. |
 
-Their commits must already be signed: for a merge commit, GitHub's signature
-rule checks every commit the merge adds to the branch. The
-`sync/public-snapshot/<date-or-version>` branches in
+The check judges these pull requests too, by their head commit: it passes
+one only when that commit is signed by a person with an OpenPGP key on their
+own GitHub account, the same judgment it makes of an ordinary pull request's
+one commit. The signature covers the commit's tree and its parents, so whoever
+signed the head answers for everything the pull request brings. The branch's
+name does not stand in for that: GitHub signs a squash merge whatever the pull
+request's commits were, and anyone with write access can create a branch of
+any name at any commit already in the repository. A head commit GitHub made
+fails: a squash merge's commit, an "Update branch" merge, a web edit or a
+conflict resolved in the web UI. So the last commit of such a branch is one a
+maintainer makes and signs: for a sync, the merge commit itself, made with
+`git merge -S`, and finished with `git commit -S` if it stopped on conflicts;
+for a subtree update, the subtree merge commit. When the check refuses the
+head of a sync, a maintainer puts a commit they sign on top of the branch and
+pushes it; a subtree update is made again instead (see
+[Signed Commits](#signed-commits)).
+
+`AS_IS_LINES` in the workflow names long-lived lines exactly, without
+patterns: a pull request whose head is one of them passes when GitHub's rules
+for that line require this check and a pull request and forbid creating,
+deleting and force-pushing it, and is otherwise judged by its head commit as
+above; it is empty in qbit.
+
+GitHub's signature rule still requires every commit of such a pull request to
+be signed: for a merge commit, it checks every commit the merge adds to the
+branch. The `sync/public-snapshot/<date-or-version>` branches in
 [Public Branch Set](#public-branch-set) are not `sync-` branches; they target
 `main`, which does not require this check.
 

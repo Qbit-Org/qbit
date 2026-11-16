@@ -56,9 +56,14 @@ commit: on most pull requests, until a maintainer has squashed and signed it.
 A standard two-commit update of a subtree inherited from Bitcoin Core
 (`src/leveldb`, `src/secp256k1`, `src/crc32c`, `src/minisketch`,
 `src/crypto/ctaes` or `src/ipc/libmultiprocess`) keeps both of its commits: it
-is opened from a `subtree-<name>` branch, which the check lets merge as it is,
-and lands with a merge commit, so both of its commits must already be signed; a
-`src/libbitcoinpqc` import is one commit, as
+is opened from a branch named `subtree-` and the subtree's directory name, such
+as `subtree-leveldb` or `subtree-ctaes`, and lands as it is, with a merge
+commit. The check passes it only when its last commit, the subtree merge, is
+signed by a person with an OpenPGP key on their own GitHub account: that
+signature covers everything the branch brings. A commit GitHub makes on the
+branch, such as an "Update branch" merge, fails it. GitHub's signature rule
+also requires both of its commits to be signed, because a merge commit adds
+them to the branch as they are. A `src/libbitcoinpqc` import is one commit, as
 [the libbitcoinpqc runbook](doc/subtrees/libbitcoinpqc.md) describes. A pull request
 from a branch in this repository lands through `squash-sign`, as described in
 [Signed Commits](doc/development/public-branch-and-rulesets.md#signed-commits).
