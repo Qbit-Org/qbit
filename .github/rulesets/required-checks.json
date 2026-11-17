@@ -1,0 +1,51 @@
+{
+  "name": "required-checks",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/heads/1.x.x",
+        "refs/heads/1.0.0",
+        "refs/heads/0.1.x"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": true,
+        "required_status_checks": [
+          {
+            "context": "signed-landing",
+            "integration_id": 15368
+          }
+        ]
+      }
+    },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "allowed_merge_methods": [
+          "merge",
+          "squash"
+        ],
+        "dismiss_stale_reviews_on_push": false,
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_approving_review_count": 0,
+        "required_review_thread_resolution": false,
+        "required_reviewers": [],
+        "dismissal_restriction": {
+          "enabled": false,
+          "allowed_actors": []
+        },
+        "require_extra_approval_for_unattributed_changes": false
+      }
+    }
+  ]
+}
