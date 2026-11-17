@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import gzip
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -150,15 +152,31 @@ def active_release_signers(release_line: str) -> dict[str, str]:
     return active
 
 
-def status_fingerprints(status_output: str) -> list[str]:
-    fingerprints: list[str] = []
-    for line in status_output.splitlines():
-        if not line.startswith("[GNUPG:] VALIDSIG "):
-            continue
-        fields = line.split()
-        if len(fields) >= 3:
-            fingerprints.append(normalize_fingerprint(fields[2]))
-    return fingerprints
+@functools.cache
+def release_key_metadata() -> Any:
+    """ci/release/validate_key_metadata.py, whose gpg output parser the release validators use."""
+
+    path = REPO_ROOT / "ci" / "release" / "validate_key_metadata.py"
+    spec = importlib.util.spec_from_file_location("validate_key_metadata", path)
+    if spec is None or spec.loader is None:
+        raise VersionedSiteError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except (OSError, SyntaxError, ImportError) as exc:
+        raise VersionedSiteError(f"cannot load the release validators' gpg output parser: {exc}") from exc
+    return module
+
+
+def status_fingerprints(status_output: bytes) -> list[str]:
+    """The fingerprints gpg's VALIDSIG status lines name, read with the release validators' parser."""
+
+    key_metadata = release_key_metadata()
+    try:
+        records = key_metadata.status_records(status_output, "git verify-tag --raw output")
+    except key_metadata.GpgOutputError as exc:
+        raise VersionedSiteError(str(exc)) from exc
+    return [normalize_fingerprint(arguments[0]) for keyword, arguments in records if keyword == "VALIDSIG"]
 
 
 def verify_tag_signed_by_active_release_key(tag: str) -> None:
@@ -181,18 +199,27 @@ def verify_tag_signed_by_active_release_key(tag: str) -> None:
             *[str(keys_dir / path) for path in active_signers.values()],
         ]
         subprocess.run(import_command, check=True, capture_output=True, text=True)
+        # Bytes: text mode would also turn a carriage return into a line feed.
         result = subprocess.run(
-            ["git", "-c", f"gpg.program={gpg}", "verify-tag", "--raw", tag],
+            # The full ref name, which git finds before any other ref;
+            # core.warnAmbiguousRefs=false keeps git from warning about such
+            # refs on standard error, which must hold gpg's status lines only.
+            ["git", "-c", f"gpg.program={gpg}", "-c", "core.warnAmbiguousRefs=false",
+             "verify-tag", "--raw", f"refs/tags/{tag}"],
             check=False,
             capture_output=True,
-            text=True,
             env={**os.environ, "GNUPGHOME": str(gnupg_home)},
         )
     if result.returncode != 0:
         raise VersionedSiteError(
             f"release tag was not signed by an active qbit release key: {tag}"
         )
-    counted = sorted(set(status_fingerprints(result.stdout + result.stderr)) & set(active_signers))
+    # --raw: gpg's status lines, and only those, on standard error.
+    try:
+        fingerprints = status_fingerprints(result.stderr)
+    except VersionedSiteError as exc:
+        raise VersionedSiteError(f"release tag {tag}: {exc}") from exc
+    counted = sorted(set(fingerprints) & set(active_signers))
     if not counted:
         raise VersionedSiteError(
             f"release tag signature did not come from an active qbit release key: {tag}"

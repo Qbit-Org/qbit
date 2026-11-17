@@ -14,6 +14,7 @@
 #include <uint256.h>
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 
 typedef std::vector<unsigned char> valtype;
@@ -58,17 +59,23 @@ size_t StackBytesFrom(const std::vector<valtype>& stack, size_t begin)
 
 bool CastToBool(const valtype& vch)
 {
-    for (unsigned int i = 0; i < vch.size(); i++)
-    {
-        if (vch[i] != 0)
-        {
-            // Can be negative zero
-            if (i == vch.size()-1 && vch[i] == 0x80)
-                return false;
-            return true;
-        }
+    if (vch.empty()) return false;
+    // Any nonzero byte before the last one makes the value true.
+    const unsigned char* const data{vch.data()};
+    const size_t body_size{vch.size() - 1};
+    size_t i{0};
+    for (; i + 64 <= body_size; i += 64) {
+        uint64_t words[8];
+        std::memcpy(words, data + i, sizeof(words));
+        uint64_t any{0};
+        for (const uint64_t word : words) any |= word;
+        if (any != 0) return true;
     }
-    return false;
+    for (; i < body_size; ++i) {
+        if (data[i] != 0) return true;
+    }
+    // The last byte alone is false when it is zero or 0x80 (negative zero).
+    return (vch.back() & 0x7f) != 0;
 }
 
 /**
@@ -531,6 +538,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
     execdata.m_codeseparator_pos_init = true;
     const bool check_p2mr_stack_bytes{sigversion == SigVersion::P2MR && (flags & SCRIPT_VERIFY_P2MR_STACK_BYTES)};
     size_t p2mr_stack_bytes{check_p2mr_stack_bytes ? StackBytesFrom(stack, 0) : 0};
+    const bool check_p2mr_hash_weight{sigversion == SigVersion::P2MR && (flags & SCRIPT_VERIFY_P2MR_HASH_WEIGHT)};
 
     try
     {
@@ -1174,6 +1182,11 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     if (stack.size() < 1)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
                     valtype& vch = stacktop(-1);
+                    if (check_p2mr_hash_weight && vch.size() > MAX_SCRIPT_ELEMENT_SIZE) {
+                        assert(execdata.m_p2mr_hash_weight_left_init);
+                        execdata.m_p2mr_hash_weight_left -= static_cast<int64_t>((vch.size() + P2MR_HASH_WEIGHT_BLOCK_SIZE - 1) / P2MR_HASH_WEIGHT_BLOCK_SIZE);
+                        if (execdata.m_p2mr_hash_weight_left < 0) return set_error(serror, SCRIPT_ERR_P2MR_HASH_WEIGHT);
+                    }
                     valtype vchHash((opcode == OP_RIPEMD160 || opcode == OP_SHA1 || opcode == OP_HASH160) ? 20 : 32);
                     if (opcode == OP_RIPEMD160)
                         CRIPEMD160().Write(vch.data(), vch.size()).Finalize(vchHash.data());
@@ -2431,6 +2444,8 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             // Initialize per-input validation weight budget
             execdata.m_validation_weight_left = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
             execdata.m_validation_weight_left_init = true;
+            execdata.m_p2mr_hash_weight_left = execdata.m_validation_weight_left;
+            execdata.m_p2mr_hash_weight_left_init = true;
 
             return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::P2MR, checker, execdata, serror);
         }

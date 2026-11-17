@@ -174,6 +174,14 @@ static RPCHelpMan getpeerinfo()
                         {RPCResult::Type::STR, "permission_type", Join(NET_PERMISSIONS_DOC, ",\n") + ".\n"},
                     }},
                     {RPCResult::Type::NUM, "minfeefilter", "The minimum fee rate for transactions this peer accepts"},
+                    {RPCResult::Type::NUM, "failed_tx_validation_time", /*optional=*/true, "The total time in microseconds spent validating transactions from this peer that were rejected\n"
+                                                                                 "for a reason in the transaction itself (only present once the version handshake has completed)"},
+                    {RPCResult::Type::BOOL, "tx_validation_throttled", /*optional=*/true, "Whether transactions from this peer are not validated because the peer is over its budget for\n"
+                                                                                "that time: it has no own credit it can use, and the shared pool for such peers or the peer's share\n"
+                                                                                "of it is empty. Updated when the peer has transactions to validate or request, and while it is set\n"
+                                                                                "(only present once the version handshake has completed)"},
+                    {RPCResult::Type::NUM, "tx_dropped_while_throttled", /*optional=*/true, "The number of transactions received from this peer that were dropped without validation\n"
+                                                                                  "because the peer was over that budget (only present once the version handshake has completed)"},
                     {RPCResult::Type::OBJ_DYN, "bytessent_per_msg", "",
                     {
                         {RPCResult::Type::NUM, "msg", "The total bytes sent aggregated by message type\n"
@@ -281,6 +289,11 @@ static RPCHelpMan getpeerinfo()
         }
         obj.pushKV("permissions", std::move(permissions));
         obj.pushKV("minfeefilter", ValueFromAmount(statestats.m_fee_filter_received));
+        if (statestats.m_tx_validation) {
+            obj.pushKV("failed_tx_validation_time", count_microseconds(statestats.m_tx_validation->failed_time));
+            obj.pushKV("tx_validation_throttled", statestats.m_tx_validation->throttled);
+            obj.pushKV("tx_dropped_while_throttled", statestats.m_tx_validation->dropped);
+        }
 
         UniValue sendPerMsgType(UniValue::VOBJ);
         for (const auto& i : stats.mapSendBytesPerMsgType) {

@@ -33,6 +33,8 @@
 #include <secp256k1.h>
 #include <univalue.h>
 
+bool CastToBool(const std::vector<unsigned char>& vch);
+
 // Uncomment if you want to output updated JSON tests.
 // #define UPDATE_JSON_TESTS
 
@@ -1738,6 +1740,65 @@ BOOST_AUTO_TEST_CASE(compute_tapbranch)
     constexpr uint256 hash2{"f224a923cd0021ab202ab139cc56802ddb92dcfc172b9212261a539df79a112a"};
     constexpr uint256 result{"a64c5b7b943315f9b805d7a7296bedfcfd08919270a1f7a1466e98f8693d8cd9"};
     BOOST_CHECK_EQUAL(ComputeTapbranchHash(hash1, hash2), result);
+}
+
+BOOST_AUTO_TEST_CASE(cast_to_bool)
+{
+    // The byte-at-a-time definition that CastToBool must keep matching.
+    const auto reference{[](const std::vector<unsigned char>& vch) {
+        for (size_t i{0}; i < vch.size(); ++i) {
+            if (vch[i] != 0) return i != vch.size() - 1 || vch[i] != 0x80;
+        }
+        return false;
+    }};
+    const auto check{[&](const std::vector<unsigned char>& vch) {
+        BOOST_CHECK_EQUAL(CastToBool(vch), reference(vch));
+    }};
+
+    check({});
+    for (int a{0}; a < 256; ++a) {
+        check({static_cast<unsigned char>(a)});
+        for (int b{0}; b < 256; ++b) {
+            check({static_cast<unsigned char>(a), static_cast<unsigned char>(b)});
+        }
+    }
+
+    // Zero, negative zero and single set bytes, around the 64-byte blocks of
+    // the scan and up to the largest P2MR initial stack element.
+    for (const size_t size : {3, 7, 8, 9, 10, 15, 16, 17, 24, 31, 32, 33, 63, 64, 65, 66, 127, 128, 129, 130, 520, 521, 16383, 16384, 16385}) {
+        std::vector<unsigned char> vch(size, 0);
+        for (const unsigned char last : {0x00, 0x01, 0x7f, 0x80, 0x81, 0xff}) {
+            vch.back() = last;
+            check(vch);
+        }
+        vch.back() = 0;
+        std::vector<size_t> positions;
+        for (size_t pos{0}; pos < size; ++pos) {
+            if (size <= 130 || pos < 66 || pos + 66 >= size || pos == size / 2) positions.push_back(pos);
+        }
+        for (const size_t pos : positions) {
+            for (const unsigned char value : {0x01, 0x80}) {
+                vch[pos] = value;
+                check(vch);
+                if (pos + 1 < size) {
+                    vch.back() = 0x80;
+                    check(vch);
+                    vch.back() = 0;
+                }
+                vch[pos] = 0;
+            }
+        }
+    }
+
+    // Random vectors that are mostly zero.
+    for (int i{0}; i < 2000; ++i) {
+        std::vector<unsigned char> vch(m_rng.randrange(300));
+        const int set_bytes{static_cast<int>(m_rng.randrange(3))};
+        for (int j{0}; j < set_bytes && !vch.empty(); ++j) {
+            vch[m_rng.randrange(vch.size())] = m_rng.randbool() ? 0x80 : static_cast<unsigned char>(m_rng.randbits(8));
+        }
+        check(vch);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(compute_tapleaf)

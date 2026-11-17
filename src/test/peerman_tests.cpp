@@ -4,14 +4,20 @@
 
 #include <net.h>
 #include <auxpow.h>
+#include <banman.h>
 #include <chainparams.h>
 #include <consensus/merkle.h>
+#include <crypto/pqc.h>
+#include <net_permissions.h>
+#include <netbase.h>
 #include <node/miner.h>
 #include <net_processing.h>
 #include <pow.h>
 #include <protocol.h>
+#include <script/interpreter.h>
 #include <script/script.h>
 #include <streams.h>
+#include <txmempool.h>
 #include <test/util/net.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
@@ -23,6 +29,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <set>
 #include <utility>
 
 BOOST_FIXTURE_TEST_SUITE(peerman_tests, RegTestingSetup)
@@ -909,6 +916,510 @@ BOOST_AUTO_TEST_CASE(headers_announcement_too_large_for_one_message_reverts_to_i
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
     m_node.validation_signals->UnregisterValidationInterface(peerman.get());
     peerman->FinalizeNode(peer);
+    connman->ClearTestNodes();
+}
+
+namespace {
+/** A chain with confirmed P2MR coins: one whose leaf takes a PQC signature, and several that
+ *  are spent with OP_TRUE. */
+struct TxValidationBudgetSetup : public TestChain100Setup {
+    using valtype = std::vector<unsigned char>;
+    static constexpr uint32_t VALID_COINS{8};
+
+    valtype m_leaf_bytes;
+    valtype m_control_block{static_cast<unsigned char>(P2MR_LEAF_VERSION_V1 | 1)};
+    CMutableTransaction m_funding;
+    //! A signature for the first spend of the PQC coin, corrupted, so every spend fails verification.
+    valtype m_corrupted_sig;
+    uint32_t m_next_invalid{0};
+    uint32_t m_next_valid{1};
+
+    TxValidationBudgetSetup() : TestChain100Setup{ChainType::REGTEST, {.extra_args = {"-p2mronly=1"}}}
+    {
+        CPQCKey key;
+        key.MakeNewKey();
+        const CPQCPubKey pubkey{key.GetPubKey()};
+        const CScript leaf_script{CScript{} << valtype(pubkey.begin(), pubkey.end()) << OP_CHECKSIGPQC};
+        m_leaf_bytes.assign(leaf_script.begin(), leaf_script.end());
+        const uint256 leaf_hash{ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, m_leaf_bytes)};
+        const uint256 merkle_root{ComputeP2MRMerkleRoot(m_control_block, leaf_hash)};
+        const CScript pqc_script_pubkey{CScript{} << OP_2 << valtype(merkle_root.begin(), merkle_root.end())};
+
+        const CAmount coin_value{m_coinbase_txns[0]->vout[0].nValue / (VALID_COINS + 2)};
+        std::vector<CTxOut> outputs(1 + VALID_COINS, CTxOut{coin_value, P2MROpTrueScript()});
+        outputs[0].scriptPubKey = pqc_script_pubkey;
+        m_funding = CreateValidMempoolTransaction(
+            /*input_transactions=*/{m_coinbase_txns[0]},
+            /*inputs=*/{COutPoint{m_coinbase_txns[0]->GetHash(), 0}},
+            /*input_height=*/COINBASE_MATURITY,
+            /*input_signing_keys=*/{coinbaseKey},
+            /*outputs=*/outputs,
+            /*submit=*/false);
+        CreateAndProcessBlock({m_funding}, P2MROpTrueScript());
+
+        CMutableTransaction first{InvalidSpend()};
+        m_next_invalid = 0;
+        PrecomputedTransactionData txdata;
+        txdata.Init(first, {m_funding.vout[0]});
+        ScriptExecutionData execdata;
+        execdata.m_annex_init = true;
+        execdata.m_annex_present = false;
+        execdata.m_tapleaf_hash = leaf_hash;
+        execdata.m_tapleaf_hash_init = true;
+        execdata.m_codeseparator_pos = 0xFFFFFFFFUL;
+        execdata.m_codeseparator_pos_init = true;
+        uint256 sighash;
+        Assert(SignatureHashP2MR(sighash, execdata, first, 0, SIGHASH_DEFAULT, txdata, MissingDataBehavior::ASSERT_FAIL));
+        uint32_t signatures_made{0};
+        Assert(key.Sign(sighash, m_corrupted_sig, signatures_made));
+        m_corrupted_sig[0] ^= 1;
+    }
+
+    /** A new transaction (with a new txid) that spends the PQC coin and fails signature verification. */
+    CMutableTransaction InvalidSpend()
+    {
+        CMutableTransaction tx;
+        tx.version = 2;
+        tx.vin.emplace_back(COutPoint{m_funding.GetHash(), 0});
+        tx.vin.back().scriptWitness.stack = {m_corrupted_sig, m_leaf_bytes, m_control_block};
+        tx.vout.emplace_back(m_funding.vout[0].nValue - 100'000 - m_next_invalid++, P2MROpTrueScript());
+        return tx;
+    }
+
+    /** A valid transaction that spends the next unspent OP_TRUE coin. */
+    CMutableTransaction ValidSpend()
+    {
+        BOOST_REQUIRE(m_next_valid <= VALID_COINS);
+        CMutableTransaction tx;
+        tx.version = 2;
+        tx.vin.emplace_back(COutPoint{m_funding.GetHash(), m_next_valid});
+        tx.vin.back().scriptWitness.stack = P2MROpTrueStack();
+        tx.vout.emplace_back(m_funding.vout[m_next_valid].nValue - 100'000, P2MROpTrueScript());
+        ++m_next_valid;
+        return tx;
+    }
+
+    bool InMempool(const CMutableTransaction& tx) const
+    {
+        return WITH_LOCK(m_node.mempool->cs, return m_node.mempool->exists(tx.GetHash()));
+    }
+};
+
+/** A budget small enough that one rejected transaction puts a peer over it: a peer's credit is
+ *  usable after one millisecond and allows a single validation, and there is no pool. */
+constexpr TxValidationBudgetOptions TINY_TX_VALIDATION_BUDGET{
+    .peer_rate = std::chrono::microseconds{1'000},
+    .peer_cap = std::chrono::microseconds{1},
+    .pool_rate = std::chrono::microseconds{0},
+    .pool_cap = std::chrono::microseconds{0},
+};
+
+CNode& AddTxTestPeer(ConnmanTestMsg& connman, NodeId id, ConnectionType conn_type, NetPermissionFlags permissions)
+    EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    auto* peer = new CNode{id,
+                           /*sock=*/nullptr,
+                           CAddress{LookupNumeric(strprintf("10.0.0.%d", id + 1), 8333), NODE_NONE},
+                           /*nKeyedNetGroupIn=*/static_cast<uint64_t>(id),
+                           /*nLocalHostNonceIn=*/static_cast<uint64_t>(id),
+                           CAddress{},
+                           /*addrNameIn=*/"",
+                           conn_type,
+                           /*inbound_onion=*/false,
+                           CNodeOptions{.permission_flags = permissions}};
+    connman.Handshake(*peer, /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    connman.AddTestNode(*peer);
+    connman.FlushSendBuffer(*peer);
+    return *peer;
+}
+
+void SendTx(ConnmanTestMsg& connman, CNode& peer, const CMutableTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    (void)connman.ReceiveMsgFrom(peer, NetMsg::Make(NetMsgType::TX, TX_WITH_WITNESS(tx)));
+    peer.fPauseSend = false;
+    connman.ProcessMessagesOnce(peer);
+}
+
+TxValidationStats GetTxValidationStats(const PeerManager& peerman, const CNode& peer)
+{
+    CNodeStateStats stats;
+    BOOST_REQUIRE(peerman.GetNodeStateStats(peer.GetId(), stats));
+    BOOST_REQUIRE(stats.m_tx_validation.has_value());
+    return *stats.m_tx_validation;
+}
+
+void AnnounceTx(ConnmanTestMsg& connman, CNode& peer, const uint256& txid) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    (void)connman.ReceiveMsgFrom(peer, NetMsg::Make(NetMsgType::INV, std::vector<CInv>{CInv{MSG_TX, txid}}));
+    peer.fPauseSend = false;
+    connman.ProcessMessagesOnce(peer);
+}
+
+/** Let peerman send its messages to peer, and return the transactions it requested. */
+std::set<uint256> RequestedTxs(PeerManager& peerman, ConnmanTestMsg& connman, CNode& peer, SentMessages& sent)
+    EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    peerman.SendMessages(&peer);
+    connman.FlushSendBuffer(peer);
+    std::set<uint256> requested;
+    for (const auto& payload : sent.Take(NetMsgType::GETDATA)) {
+        DataStream stream{payload};
+        std::vector<CInv> invs;
+        stream >> invs;
+        for (const CInv& inv : invs) {
+            if (inv.IsGenTxMsg()) requested.insert(inv.hash);
+        }
+    }
+    return requested;
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(tx_validation_budget_throttles_peer, TxValidationBudgetSetup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{*Assert(m_node.chainman)};
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+    const auto start{GetTime<std::chrono::seconds>()};
+    SetMockTime(start);
+
+    PeerManager::Options opts;
+    opts.tx_validation_budget = TINY_TX_VALIDATION_BUDGET;
+    auto connman = std::make_unique<ConnmanTestMsg>(0x7275, 0x7275, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, m_node.banman.get(), chainman, *m_node.mempool, *m_node.warnings, opts);
+    connman->SetMsgProc(peerman.get());
+    CNode& peer_a{AddTxTestPeer(*connman, /*id=*/0, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    CNode& peer_b{AddTxTestPeer(*connman, /*id=*/1, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    // Let both peers earn the credit they can use.
+    SetMockTime(start + 1s);
+
+    // Peer A sends transactions with a corrupted signature. The first is validated and puts A
+    // over its budget; the others are dropped without verifying their signatures.
+    {
+        ScopedPQCVerificationCounter verifications;
+        for (int i{0}; i < 5; ++i) SendTx(*connman, peer_a, InvalidSpend());
+        BOOST_CHECK_EQUAL(verifications.GetCount(), 1U);
+    }
+    TxValidationStats stats_a{GetTxValidationStats(*peerman, peer_a)};
+    BOOST_CHECK(stats_a.throttled);
+    BOOST_CHECK(stats_a.failed_time > 0us);
+    BOOST_CHECK_EQUAL(stats_a.dropped, 4U);
+    // A is neither disconnected nor discouraged.
+    peerman->SendMessages(&peer_a);
+    BOOST_CHECK(!peer_a.fDisconnect);
+    BOOST_CHECK(!m_node.banman->IsDiscouraged(peer_a.addr));
+
+    // Peer B's valid transaction is accepted while A is over its budget.
+    const CMutableTransaction valid_b{ValidSpend()};
+    SendTx(*connman, peer_b, valid_b);
+    BOOST_CHECK(InMempool(valid_b));
+
+    // A valid transaction from A is dropped, not rejected: the same transaction from B is accepted.
+    const CMutableTransaction valid_a{ValidSpend()};
+    SendTx(*connman, peer_a, valid_a);
+    BOOST_CHECK(!InMempool(valid_a));
+    BOOST_CHECK_EQUAL(GetTxValidationStats(*peerman, peer_a).dropped, 5U);
+    SendTx(*connman, peer_b, valid_a);
+    BOOST_CHECK(InMempool(valid_a));
+
+    const TxValidationStats stats_b{GetTxValidationStats(*peerman, peer_b)};
+    BOOST_CHECK(!stats_b.throttled);
+    BOOST_CHECK(stats_b.failed_time == 0us);
+    BOOST_CHECK_EQUAL(stats_b.dropped, 0U);
+
+    // Once A's credit has refilled, its next transaction is validated again.
+    SetMockTime(start + 1h);
+    const CMutableTransaction later_a{ValidSpend()};
+    SendTx(*connman, peer_a, later_a);
+    BOOST_CHECK(InMempool(later_a));
+    stats_a = GetTxValidationStats(*peerman, peer_a);
+    BOOST_CHECK(!stats_a.throttled);
+    BOOST_CHECK_EQUAL(stats_a.dropped, 5U);
+    BOOST_CHECK(!peer_a.fDisconnect);
+
+    peerman->FinalizeNode(peer_a);
+    peerman->FinalizeNode(peer_b);
+    connman->ClearTestNodes();
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_validation_budget_exempts_noban_and_manual_peers, TxValidationBudgetSetup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{*Assert(m_node.chainman)};
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+    const auto start{GetTime<std::chrono::seconds>()};
+    SetMockTime(start);
+
+    PeerManager::Options opts;
+    opts.tx_validation_budget = TINY_TX_VALIDATION_BUDGET;
+    auto connman = std::make_unique<ConnmanTestMsg>(0x7276, 0x7276, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, m_node.banman.get(), chainman, *m_node.mempool, *m_node.warnings, opts);
+    connman->SetMsgProc(peerman.get());
+    CNode& noban{AddTxTestPeer(*connman, /*id=*/0, ConnectionType::INBOUND, NetPermissionFlags::NoBan)};
+    CNode& manual{AddTxTestPeer(*connman, /*id=*/1, ConnectionType::MANUAL, NetPermissionFlags::None)};
+    SetMockTime(start + 1s);
+
+    // The same stream as in tx_validation_budget_throttles_peer: every transaction is validated.
+    for (CNode* peer : {&noban, &manual}) {
+        ScopedPQCVerificationCounter verifications;
+        for (int i{0}; i < 5; ++i) SendTx(*connman, *peer, InvalidSpend());
+        BOOST_CHECK_EQUAL(verifications.GetCount(), 5U);
+        const TxValidationStats stats{GetTxValidationStats(*peerman, *peer)};
+        BOOST_CHECK(!stats.throttled);
+        BOOST_CHECK(stats.failed_time > 0us);
+        BOOST_CHECK_EQUAL(stats.dropped, 0U);
+    }
+
+    // They still have their valid transactions accepted.
+    const CMutableTransaction valid{ValidSpend()};
+    SendTx(*connman, noban, valid);
+    BOOST_CHECK(InMempool(valid));
+
+    peerman->FinalizeNode(noban);
+    peerman->FinalizeNode(manual);
+    connman->ClearTestNodes();
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_validation_budget_requests_again_after_throttling, TxValidationBudgetSetup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{*Assert(m_node.chainman)};
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+    const auto start{GetTime<std::chrono::seconds>()};
+    SetMockTime(start);
+
+    PeerManager::Options opts;
+    opts.tx_validation_budget = TINY_TX_VALIDATION_BUDGET;
+    auto connman = std::make_unique<ConnmanTestMsg>(0x7277, 0x7277, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, m_node.banman.get(), chainman, *m_node.mempool, *m_node.warnings, opts);
+    connman->SetMsgProc(peerman.get());
+    // An outbound peer, so that the transactions it announces can be requested from it at once.
+    CNode& peer_a{AddTxTestPeer(*connman, /*id=*/0, ConnectionType::OUTBOUND_FULL_RELAY, NetPermissionFlags::None)};
+    CNode& peer_b{AddTxTestPeer(*connman, /*id=*/1, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    SentMessages sent{*m_node.args};
+    SetMockTime(start + 1s);
+
+    // While within its budget, a transaction that only peer A announces is due to be requested
+    // from it.
+    const uint256 announced_before{0xb1};
+    AnnounceTx(*connman, peer_a, announced_before);
+
+    // A rejected transaction puts A over its budget before the request is sent.
+    SendTx(*connman, peer_a, InvalidSpend());
+    BOOST_REQUIRE(GetTxValidationStats(*peerman, peer_a).throttled);
+
+    // The request that has fallen due is released instead of being sent.
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+
+    // A transaction A announces now is not requested from it.
+    const uint256 announced_while_throttled{0xb2};
+    AnnounceTx(*connman, peer_a, announced_while_throttled);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+
+    // Valid transactions A sends now are dropped without validation. One of them arrives from
+    // peer B as well, and is accepted from it.
+    const CMutableTransaction sent_while_throttled{ValidSpend()};
+    const CMutableTransaction also_from_b{ValidSpend()};
+    SendTx(*connman, peer_a, sent_while_throttled);
+    SendTx(*connman, peer_a, also_from_b);
+    BOOST_CHECK(!InMempool(sent_while_throttled));
+    BOOST_CHECK_EQUAL(GetTxValidationStats(*peerman, peer_a).dropped, 2U);
+    SendTx(*connman, peer_b, also_from_b);
+    BOOST_CHECK(InMempool(also_from_b));
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+
+    // Once A is within its budget again (its debt is at most 1 s, repaid at 1 ms per second),
+    // everything it announced or sent meanwhile is requested from it, apart from the transaction
+    // that has arrived from B.
+    SetMockTime(start + 1002s);
+    const std::set<uint256> requested{RequestedTxs(*peerman, *connman, peer_a, sent)};
+    BOOST_CHECK(!GetTxValidationStats(*peerman, peer_a).throttled);
+    const std::set<uint256> expected{announced_before, announced_while_throttled, sent_while_throttled.GetHash().ToUint256()};
+    BOOST_CHECK(requested == expected);
+
+    // The transaction A sends in reply is validated and accepted.
+    SendTx(*connman, peer_a, sent_while_throttled);
+    BOOST_CHECK(InMempool(sent_while_throttled));
+    BOOST_CHECK_EQUAL(GetTxValidationStats(*peerman, peer_a).dropped, 2U);
+    BOOST_CHECK(!peer_a.fDisconnect);
+    BOOST_CHECK(!m_node.banman->IsDiscouraged(peer_a.addr));
+
+    // Nothing is requested again, also after the requests A did not answer have timed out (after
+    // 60 s) and the deferred announcements could have been announced again (every 67 s).
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    SetMockTime(start + 1100s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    SetMockTime(start + 1170s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+
+    peerman->FinalizeNode(peer_a);
+    peerman->FinalizeNode(peer_b);
+    connman->ClearTestNodes();
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_validation_budget_deferred_announcements_wait_for_retry_delay, TxValidationBudgetSetup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{*Assert(m_node.chainman)};
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+    const auto start{GetTime<std::chrono::seconds>()};
+    SetMockTime(start);
+
+    // No peer's own credit reaches its cap here, so every peer draws on the pool. One rejected
+    // transaction empties the pool, and the pool and the sender's share of it are full again one
+    // second later, whatever the validation cost (a balance does not go below the floor of -1 s).
+    PeerManager::Options opts;
+    opts.tx_validation_budget = TxValidationBudgetOptions{
+        .peer_rate = 1us,
+        .peer_cap = 1h,
+        .pool_rate = 10s,
+        .pool_cap = 1us,
+    };
+    auto connman = std::make_unique<ConnmanTestMsg>(0x7279, 0x7279, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, m_node.banman.get(), chainman, *m_node.mempool, *m_node.warnings, opts);
+    connman->SetMsgProc(peerman.get());
+    // An inbound peer, whose announcements are requested only after a delay.
+    CNode& quiet{AddTxTestPeer(*connman, /*id=*/0, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    CNode& sender{AddTxTestPeer(*connman, /*id=*/1, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    SentMessages sent{*m_node.args};
+    // As DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY in net_processing.cpp.
+    constexpr auto RETRY_DELAY{67s};
+
+    const auto empty_pool{[&]() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+        const auto charged{GetTxValidationStats(*peerman, sender).failed_time};
+        SendTx(*connman, sender, InvalidSpend());
+        BOOST_REQUIRE(GetTxValidationStats(*peerman, sender).failed_time > charged);
+    }};
+    // Move to time, optionally empty the pool, then let peerman send its messages to the quiet peer.
+    const auto requested_at{[&](std::chrono::seconds time, bool pool_empty) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+        SetMockTime(time);
+        if (pool_empty) empty_pool();
+        return RequestedTxs(*peerman, *connman, quiet, sent);
+    }};
+
+    // The quiet peer announces a transaction while the pool is empty. It is over the budget, so
+    // the announcement is deferred. The peer sends nothing else in this test.
+    const uint256 txid{0xd1};
+    BOOST_CHECK(requested_at(start + 1s, /*pool_empty=*/true).empty());
+    AnnounceTx(*connman, quiet, txid);
+    BOOST_CHECK(GetTxValidationStats(*peerman, quiet).throttled);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, quiet, sent).empty());
+
+    // A second later the pool is full again: the peer is within the budget and the announcement
+    // is passed on. The request is not due yet.
+    const auto passed_on{start + 2s};
+    BOOST_CHECK(requested_at(passed_on, /*pool_empty=*/false).empty());
+    BOOST_CHECK(!GetTxValidationStats(*peerman, quiet).throttled);
+
+    // The pool is empty whenever the peer's messages are sent during the next seconds, so the
+    // request that falls due is released, not sent, and the announcement is deferred again.
+    for (auto time{passed_on + 1s}; time <= passed_on + 6s; time += 1s) {
+        BOOST_CHECK(requested_at(time, /*pool_empty=*/true).empty());
+    }
+    BOOST_CHECK(GetTxValidationStats(*peerman, quiet).throttled);
+
+    // From now on the pool stays full. The peer is within the budget again, which is still
+    // noticed at once, but the announcement is not passed on again before the retry delay has
+    // passed since the last time: nothing is requested meanwhile.
+    for (auto time{passed_on + 7s}; time < passed_on + RETRY_DELAY; time += 1s) {
+        BOOST_CHECK(requested_at(time, /*pool_empty=*/false).empty());
+        BOOST_CHECK(!GetTxValidationStats(*peerman, quiet).throttled);
+    }
+
+    // Then it is passed on, and the transaction is requested from the peer exactly once.
+    std::set<uint256> requested;
+    size_t requests{0};
+    for (auto time{passed_on + RETRY_DELAY}; time <= passed_on + RETRY_DELAY + 6s; time += 1s) {
+        std::set<uint256> now_requested{requested_at(time, /*pool_empty=*/false)};
+        requests += now_requested.size();
+        requested.merge(now_requested);
+    }
+    BOOST_CHECK(requested == std::set<uint256>{txid});
+    BOOST_CHECK_EQUAL(requests, 1U);
+
+    // It is not requested again, also after the request the peer did not answer has timed out
+    // and another retry delay has passed.
+    for (const auto later : {RETRY_DELAY + 70s, 2 * RETRY_DELAY + 10s, 3 * RETRY_DELAY + 10s}) {
+        BOOST_CHECK(requested_at(passed_on + later, /*pool_empty=*/false).empty());
+    }
+    BOOST_CHECK(!quiet.fDisconnect);
+    BOOST_CHECK(!sender.fDisconnect);
+
+    peerman->FinalizeNode(quiet);
+    peerman->FinalizeNode(sender);
+    connman->ClearTestNodes();
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_validation_budget_requests_again_after_other_announcers_fail, TxValidationBudgetSetup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{*Assert(m_node.chainman)};
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+    const auto start{GetTime<std::chrono::seconds>()};
+    SetMockTime(start);
+
+    // As TINY_TX_VALIDATION_BUDGET, but a peer's credit grows by one second per second, so that a
+    // peer over its budget is within it again one second later, whatever its debt.
+    PeerManager::Options opts;
+    opts.tx_validation_budget = TINY_TX_VALIDATION_BUDGET;
+    opts.tx_validation_budget.peer_rate = 1s;
+    auto connman = std::make_unique<ConnmanTestMsg>(0x7278, 0x7278, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, m_node.banman.get(), chainman, *m_node.mempool, *m_node.warnings, opts);
+    connman->SetMsgProc(peerman.get());
+    CNode& peer_a{AddTxTestPeer(*connman, /*id=*/0, ConnectionType::OUTBOUND_FULL_RELAY, NetPermissionFlags::None)};
+    CNode& peer_b{AddTxTestPeer(*connman, /*id=*/1, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    CNode& peer_c{AddTxTestPeer(*connman, /*id=*/2, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    SentMessages sent{*m_node.args};
+    const auto requested_from_b_or_c{[&]() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+        std::set<uint256> requested{RequestedTxs(*peerman, *connman, peer_b, sent)};
+        requested.merge(RequestedTxs(*peerman, *connman, peer_c, sent));
+        return requested;
+    }};
+    SetMockTime(start + 1s);
+
+    // Three peers announce a transaction; it is due to be requested from A, the outbound peer, first.
+    const uint256 txid{0xc1};
+    AnnounceTx(*connman, peer_a, txid);
+    AnnounceTx(*connman, peer_b, txid);
+    AnnounceTx(*connman, peer_c, txid);
+
+    // A goes over its budget, so the request is released and B or C is asked instead.
+    SendTx(*connman, peer_a, InvalidSpend());
+    BOOST_REQUIRE(GetTxValidationStats(*peerman, peer_a).throttled);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    SetMockTime(start + 4s);
+    BOOST_CHECK(requested_from_b_or_c() == std::set<uint256>{txid});
+
+    // A is within its budget again while the request to another peer is outstanding, so it is not
+    // asked yet.
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    BOOST_CHECK(!GetTxValidationStats(*peerman, peer_a).throttled);
+
+    // Neither B nor C replies. Each request times out after 60 s, and then the other is asked.
+    SetMockTime(start + 65s);
+    BOOST_CHECK(requested_from_b_or_c() == std::set<uint256>{txid});
+    SetMockTime(start + 4s + 67s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    SetMockTime(start + 126s);
+    BOOST_CHECK(requested_from_b_or_c().empty());
+
+    // Once both have timed out, A is asked.
+    SetMockTime(start + 4s + 2 * 67s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent) == std::set<uint256>{txid});
+
+    // Only once, also after A has not replied.
+    SetMockTime(start + 1000s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    SetMockTime(start + 1070s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    BOOST_CHECK(!peer_a.fDisconnect);
+
+    peerman->FinalizeNode(peer_a);
+    peerman->FinalizeNode(peer_b);
+    peerman->FinalizeNode(peer_c);
     connman->ClearTestNodes();
 }
 

@@ -84,7 +84,10 @@ FOLDED_OPERATOR_KEYS_PATH_ENTRIES = {fold_path(entry): entry for entry in OPERAT
 def touches_operator_keys(path: str) -> bool:
     # Folded, so that case and Unicode-compatibility variants of the policy
     # path or of .gitattributes, which case-insensitive checkouts treat as
-    # the same file, are routed too.
+    # the same file, are routed too. ci/release/key_policy_gate.py decides
+    # with its own copy (touches_policy), so that this file is not part of
+    # the gate's code; test_key_policy_gate_contract.py holds the two to one
+    # answer.
     folded = fold_path(path)
     entries = FOLDED_OPERATOR_KEYS_PATH_ENTRIES
     components = path.split("/")
@@ -261,7 +264,10 @@ def load_changed_files(path: str) -> list[str]:
         data = file.read()
     if b"\0" in data:
         return [name.decode("utf8", errors="surrogateescape") for name in data.split(b"\0") if name]
-    return [unquote_git_path(line) for line in data.decode("utf8", errors="surrogateescape").splitlines()]
+    # git ends each name with a line feed only; a name printed unquoted
+    # (core.quotePath=false) may hold U+2028 and the like, which splitlines()
+    # would also split at.
+    return [unquote_git_path(line) for line in data.decode("utf8", errors="surrogateescape").split("\n") if line]
 
 
 def bool_output(value: bool) -> str:

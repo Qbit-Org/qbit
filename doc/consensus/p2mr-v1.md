@@ -418,9 +418,11 @@ digest and optional sighash suffix; section 8 defines the separate
 data-signature digest and forbids a sighash suffix.
 
 The `2^30` contract binds signers. qbit wallet signing counters enforce it
-operationally for wallet-held keys. Signing with caller-supplied keys outside
-a wallet does not track usage across calls, so the caller is responsible for
-it.
+operationally for wallet-held keys, per descriptor: a key held in more than
+one descriptor, wallet, or wallet copy has a separate counter in each, so the
+wallet does not enforce the contract across them. Signing with
+caller-supplied keys outside a wallet does not track usage across calls, so
+the caller is responsible for it.
 Secret-key serialization, seed derivation, counter persistence, reservation,
 backup, and wallet refusal are wallet-safety rules, not script-verification
 inputs.

@@ -14,6 +14,7 @@ their keys and signature records.
 
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import json
@@ -36,6 +37,7 @@ from test_classifier_ci_contract import REPO_ROOT, WorkflowLoader, run_bash_step
 import classify_merge_profile  # noqa: E402
 
 sys.path.insert(0, str(REPO_ROOT / "ci" / "release"))
+import key_policy_gate  # noqa: E402
 import validate_key_metadata  # noqa: E402
 
 WORKFLOW = REPO_ROOT / ".github/workflows/required-merge-gate.yml"
@@ -119,6 +121,156 @@ def packets(raw: bytes) -> list[tuple[int, int, bytes]]:
         signature_type = body[1] if tag == 2 and body and body[0] in (4, 5, 6) else -1
         out.append((tag, signature_type, raw[start:index]))
     return out
+
+
+class GateCodeTest(unittest.TestCase):
+    """The gate's code is its workflow, its script and the one module the script loads.
+
+    A change to those files needs the signers' approvals; nothing else does.
+    These tests fail when the script or the validator imports a module that is
+    not the standard library's, loads a module by path, names another script
+    in a string it could run or read (docstrings may name one), or finds its
+    own place in the checkout in a new way: such a file would have to join
+    GATE_CODE_PATHS. They read the source; they do not prove what it can run,
+    which is for the signers to review.
+    """
+
+    LOADERS = {"import_module", "spec_from_file_location", "module_from_spec", "exec_module", "run_path", "run_module"}
+    BUILTIN_LOADERS = {"__import__", "exec", "eval", "compile"}
+
+    @staticmethod
+    def parse(path: Path) -> ast.Module:
+        return ast.parse((REPO_ROOT / path).read_text(encoding="utf8"), filename=str(path))
+
+    def test_the_gates_code_imports_only_the_standard_library_and_pyyaml(self) -> None:
+        for path, others in ((GATE_SCRIPT, {"yaml"}), (VALIDATOR, set())):
+            with self.subTest(path=str(path)):
+                imported = set()
+                for node in ast.walk(self.parse(path)):
+                    if isinstance(node, ast.Import):
+                        imported |= {alias.name.split(".")[0] for alias in node.names}
+                    elif isinstance(node, ast.ImportFrom):
+                        self.assertEqual(node.level, 0, f"{path} imports from its own directory")
+                        imported.add((node.module or "").split(".")[0])
+                self.assertEqual(imported - set(sys.stdlib_module_names) - others, set())
+
+    def test_the_gate_loads_only_its_validator_from_the_checkout(self) -> None:
+        tree = self.parse(GATE_SCRIPT)
+        loader = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "load_module")
+        inside = {id(node) for node in ast.walk(loader)}
+        loaded, beside, problems = [], [], []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+                if name == "load_module":
+                    loaded.append(ast.unparse(node.args[1]))
+                if (name in self.LOADERS and id(node) not in inside) or (isinstance(node.func, ast.Name) and name in self.BUILTIN_LOADERS):
+                    problems.append(f"line {node.lineno}: {ast.unparse(node.func)}")
+            # Files named beside the script, and any step out of its directory.
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div) and ast.unparse(node.left) == "HERE":
+                beside.append(ast.unparse(node.right))
+            if isinstance(node, ast.Attribute) and ast.unparse(node.value) == "HERE" and node.attr in {"parent", "parents"}:
+                problems.append(f"line {node.lineno}: HERE.{node.attr}")
+        validator = repr(VALIDATOR.name)
+        self.assertEqual(problems, [])
+        self.assertEqual(loaded, [f"HERE / {validator}"])
+        self.assertEqual(set(beside), {validator})
+        # Neither file names a script other than the gate's own in a string
+        # it could run or read. A docstring may: the gate's says where the
+        # classifier keeps its copy of the path rule.
+        own = {GATE_SCRIPT.name, VALIDATOR.name, GATE_SCRIPT.as_posix(), VALIDATOR.as_posix(), "base-validator.py"}
+        for path in (GATE_SCRIPT, VALIDATOR):
+            tree = self.parse(path)
+            docstrings = {
+                id(node.body[0].value)
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant)
+            }
+            named = {
+                word.strip("`'\".,:;()[]{}")
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings
+                for word in node.value.split()
+            }
+            scripts = {word for word in named if word.endswith((".py", ".sh", ".pyc")) and word not in own}
+            self.assertEqual(scripts, set(), str(path))
+            # ... and each finds its place in the checkout once.
+            places = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "__file__"]
+            self.assertEqual(len(places), 2 if path == GATE_SCRIPT else 1, f"{path} uses __file__ at lines {places}")
+        # The validator loads nothing by name at all.
+        for node in ast.walk(self.parse(VALIDATOR)):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                self.assertNotIn(node.func.id, self.LOADERS | self.BUILTIN_LOADERS, f"{VALIDATOR} line {node.lineno}")
+            elif isinstance(node, ast.Call):
+                self.assertNotIn(getattr(node.func, "attr", ""), self.LOADERS, f"{VALIDATOR} line {node.lineno}")
+
+    def test_the_gates_code_is_what_the_job_runs(self) -> None:
+        self.assertEqual(
+            set(key_policy_gate.GATE_CODE_PATHS),
+            {key_policy_gate.GATE_WORKFLOW, GATE_SCRIPT.as_posix(), VALIDATOR.as_posix()},
+        )
+        self.assertEqual(key_policy_gate.GATE_VALIDATOR, VALIDATOR.as_posix())
+        workflow = yaml.load((REPO_ROOT / key_policy_gate.GATE_WORKFLOW).read_text(encoding="utf8"), Loader=WorkflowLoader)
+        runs = [step["run"] for job in workflow["jobs"].values() for step in job["steps"] if "run" in step]
+        # Every file of this repository a step names, whatever its kind: a
+        # script the job ran would be gate code.
+        words = {word.strip("\"'`;()") for run in runs for word in run.split()}
+        named = {word for word in words if "/" in word and not word.startswith(("/", "$", "-", "+")) and (REPO_ROOT / word).is_file()}
+        self.assertEqual(named, {GATE_SCRIPT.as_posix()})
+        self.assertEqual({word for word in words if word.endswith((".py", ".sh"))}, {GATE_SCRIPT.as_posix()})
+        for job in workflow["jobs"].values():
+            for step in job["steps"]:
+                self.assertFalse(str(step.get("uses", "")).startswith("."), "the job uses an action from the checkout")
+
+    def test_this_repositorys_workflows_pass_the_scan(self) -> None:
+        # The gate scans every workflow whenever a pull request changes one:
+        # a workflow here that it refuses would stop all of them.
+        previous = os.getcwd()
+        os.chdir(REPO_ROOT)
+        try:
+            self.assertIn(key_policy_gate.GATE_WORKFLOW, key_policy_gate.workflow_files("HEAD"))
+            key_policy_gate.check_gate_check_name("HEAD", [])
+        finally:
+            os.chdir(previous)
+
+    def test_the_gate_and_the_classifier_agree_on_policy_paths(self) -> None:
+        # The gate decides with its own copy of the classifier's rule, so that
+        # the classifier is not gate code.
+        self.assertEqual(tuple(prefix.rstrip("/") for prefix in classify_merge_profile.OPERATOR_KEYS_PREFIXES), (key_policy_gate.POLICY_DIR,))
+        self.assertEqual(set(key_policy_gate.POLICY_PATH_ENTRIES), set(classify_merge_profile.OPERATOR_KEYS_PATH_ENTRIES))
+        paths = [
+            "contrib", "contrib/keys", "contrib/keys/operator-keys", "contrib/keys/operator-keys/keys.json",
+            "contrib/keys/operator-keys/approvals/x/policy.SHA256", "contrib/keys/README.md", "contrib/keys/gate-approvals/x/gate.SHA256",
+            "contrib/keys/operator-keysX/keys.json", "contrib/keys/operator-key", "contrib/other", "contribX",
+            "Contrib/keys/operator-keys/keys.json", "contrib/Keys", "CONTRIB", "contrib/keys/OPERATOR-KEYS",
+            "contrib/key\u017f/operator-keys/keys.json", "\uff43ontrib/keys/operator-keys/keys.json", "contrib/keys/operator\u2010keys/keys.json",
+            ".gitattributes", "doc/.gitattributes", "src/a/b/.GitAttributes", ".gitattribute\u017f", "doc/.gitattributes/x", "doc/x.gitattributes",
+            ".gitattributes/", "doc//.gitattributes", "doc/./.gitattributes", "doc/..", "", "/", "a", "ci/release/key_policy_gate.py",
+            ".github/workflows/key-policy-gate.yml", "doc/notes.md", "contrib/keys/operator-keys/", "contrib//keys",
+            "doc/\udcff.gitattributes", "doc/\udcff/.gitattributes", "contrib/keys/operator-keys/\n", "\u202e.gitattributes",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual(key_policy_gate.fold(path), classify_merge_profile.fold_path(path))
+                self.assertEqual(key_policy_gate.touches_policy(path), classify_merge_profile.touches_operator_keys(path))
+        # Every path of this repository, and the policy's path in other letters at every depth.
+        tracked = subprocess.run(["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True, check=True).stdout
+        generated = []
+        for entry in (*key_policy_gate.POLICY_PATH_ENTRIES, key_policy_gate.POLICY_FILE, "doc/.gitattributes"):
+            for index, letter in enumerate(entry):
+                if letter.isalpha():
+                    # Upper case, and the fullwidth form NFKC folds back.
+                    generated.append(entry[:index] + letter.upper() + entry[index + 1 :])
+                    generated.append(entry[:index] + chr(ord(letter) - ord("a") + 0xFF41) + entry[index + 1 :])
+            generated += [entry + "/x", entry + "x", "x" + entry, entry.replace("s", "\u017f")]
+        for path in [name.decode("utf8", errors="surrogateescape") for name in tracked.split(b"\0") if name] + generated:
+            if key_policy_gate.touches_policy(path) != classify_merge_profile.touches_operator_keys(path):
+                self.fail(f"the gate and the classifier disagree on {path!r}")
+        self.assertGreater(tracked.count(b"\0"), 1000)
+        self.assertTrue(key_policy_gate.touches_policy("contrib/keys/operator-keys/keys.json"))
+        self.assertTrue(key_policy_gate.touches_policy("src/vendored/.gitattributes"))
+        self.assertFalse(key_policy_gate.touches_policy("contrib/keys/README.md"))
 
 
 # CI must run these tests: without gpg they fail there, and only skip locally.
@@ -549,6 +701,16 @@ class KeyPolicyGateContractTest(unittest.TestCase):
     def test_certificate_refresh_that_adds_a_self_signature_passes(self) -> None:
         self.replace_certificate("operator-01", self.merged_refresh)
         self.assert_accepted("Base policy: certificates updated: operator-01")
+
+    def test_a_certificate_whose_user_id_holds_a_line_separator_is_refused(self) -> None:
+        # gpg lists the user ID as it is, so a reader splitting there would read records gpg never wrote.
+        primary = self.signers["operator-01"]["primary"]
+        home = self.root / "separator-gnupg"
+        shutil.copytree(self.home, home, ignore=shutil.ignore_patterns("S.*"))
+        self.addCleanup(subprocess.run, ["gpgconf", "--homedir", str(home), "--kill", "all"], check=False, capture_output=True)
+        self.gpg("--quick-add-uid", primary, "operator-01\u2028rev <operator-01@example.invalid>", home=home)
+        self.replace_certificate("operator-01", self.export(primary, home=home))
+        self.assert_refused("line separator other than a line feed (U+2028)")
 
     def test_certificate_change_that_drops_a_signature_record_is_refused(self) -> None:
         self.replace_certificate("operator-01", self.merged_refresh)

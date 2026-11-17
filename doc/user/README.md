@@ -32,6 +32,10 @@ testnet4 network remains available through its explicit chain flags.
 - [qbit.conf Configuration File](setup/bitcoin-conf.md)
 - [Files](setup/files.md)
 
+## GUI Extras
+
+- [Poker Lobby (Play Money)](poker.md)
+
 ## Network Transports
 
 These are technical references for optional transport configuration, not

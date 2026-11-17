@@ -9,3 +9,6 @@
 /.github/actions/ @Qbit-Org/release-maintainers
 .gitattributes @Qbit-Org/release-maintainers
 /.github/CODEOWNERS @Qbit-Org/release-maintainers
+# GitHub reads these two only when the file above is gone; they stay owned.
+/CODEOWNERS @Qbit-Org/release-maintainers
+/docs/CODEOWNERS @Qbit-Org/release-maintainers

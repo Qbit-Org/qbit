@@ -94,7 +94,7 @@ body:
         - label: Follow-up trust-record PR merged (trusted_release_ref SHA, the publisher's evidence lines, the ref it ran from, release URL and immutable state).
         - label: Builders removed their build roots only after publication, once each attested artifact set's published lines matched their manifest for that set.
         - label: Release integrated into main as the operator decided for this release (v1.0.1 - admin fast-forward to the named release commit, which contains the tag target and both trust records), and the new main commit recorded here.
-        - label: "Only for v1.0.1: Key Policy Gate armed after the fast-forward, in order: Actions event policy before 2026-12-02; the per-base checks in the main and 1.x.x rulesets, from GitHub Actions, with code-owner review and up-to-date branches; write access for release-maintainers (contrib/keys/README.md)."
+        - label: "Only for v1.0.1: Key Policy Gate armed after the fast-forward, in order: Actions event policy before 2026-12-02; write access for release-maintainers; the per-base checks in the main and 1.x.x rulesets, from GitHub Actions, with code-owner review and up-to-date branches (contrib/keys/README.md)."
         - label: RPC docs on docs.qbit.org list the release.
         - label: Downstream pins bumped in qbit-rpc, qbit-js, qbit-wallet, qbit-mining-bootstrap and qbit-electrs.
         - label: This issue closed with links to the release, the trust record and the downstream PRs.

@@ -1089,7 +1089,9 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
             return false;
         }
         m_map_crypted_keys[pubkey.GetID()] = make_pair(pubkey, crypted_secret);
-        batch->WriteCryptedDescriptorKey(GetID(), pubkey, crypted_secret);
+        if (!batch->WriteCryptedDescriptorKey(GetID(), pubkey, crypted_secret)) {
+            return false;
+        }
     }
     for (const auto& [pubkey, key] : m_map_pqc_keys) {
         std::vector<unsigned char> crypted_secret;

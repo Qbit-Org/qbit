@@ -12,6 +12,7 @@
 #include <qt/test/clientmodeltests.h>
 #include <qt/test/modaloverlaytests.h>
 #include <qt/test/optiontests.h>
+#include <qt/test/pokertests.h>
 #include <qt/test/rpcnestedtests.h>
 #include <qt/test/uritests.h>
 #include <test/util/setup_common.h>
@@ -116,6 +117,9 @@ int main(int argc, char* argv[])
 
         URITests test1;
         num_test_failures += QTest::qExec(&test1);
+
+        PokerTests poker_tests;
+        num_test_failures += QTest::qExec(&poker_tests);
 
         RPCNestedTests test3(app.node());
         num_test_failures += QTest::qExec(&test3);

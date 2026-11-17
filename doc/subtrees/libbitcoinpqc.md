@@ -46,10 +46,15 @@ optimization and 288 KiB without it (208 KiB before `v0.3.2`). qbit compiles
 the subtree with its RelWithDebInfo C flags (`-O2`) in every build type.
 CMake places them after `CMAKE_C_FLAGS`, which is where `APPEND_CFLAGS` and
 `APPEND_CPPFLAGS` go, so an appended `-O0` does not take effect: the
-optimized size applies and each call needs about 17 KiB of free stack.
-Verification does not burn. qbit does not shrink
-the stacks of the threads that sign, so they keep the platform default, which
-is 512 KiB or more on qbit's release platforms.
+optimized size applies and each direct call into the library needs about
+17 KiB of free stack. qbit's own wrappers need more: after each
+`CPQCKey::MakeNewKey()`, `CPQCKey::Set()`, `CPQCKey::Sign()` and
+`DerivePQCKey()` call, qbit overwrites `PQC_STACK_BURN_BYTES` (32 KiB) of the
+stack the call released, so each of those calls needs at least 32 KiB of
+free stack plus its own frames. Verification does not burn. qbit does not
+shrink the stacks of the threads that sign, so they keep the platform
+default, which is 512 KiB or more on qbit's release platforms. musl gives
+threads only 128 KiB by default, which leaves less margin.
 
 `v0.3.2` adds `BITCOIN_PQC_ERROR_OUT_OF_MEMORY` (`-6`), which keygen and sign
 return when an allocation fails, and signing with a secret key that fails
@@ -175,6 +180,32 @@ Then update every pin location in a separate commit:
 lists the remaining mentions to review; release notes and the fixed fixtures in
 `ci/scanners/test_run_scanners.py` keep theirs.
 
+### Signing The Import
+
+Under the signed-commit policy, `squash-sign` squashes the pull request's
+commits (the import, the pin and test changes, and the release notes) into one
+operator-signed commit. The helper's import is one main-line commit that
+carries the `git-subtree-dir` and `git-subtree-split` trailers, and
+`squash-sign` keeps those trailers. GitHub's squash merge then lands that
+commit's message, trailers included, on the branch, so the lint still passes
+there; that needs one touch. See
+[Signed Commits](../development/public-branch-and-rulesets.md#signed-commits).
+
+For a large vendored import, the signature attests the pin, not a line-by-line
+reading of the vendored code: the operator does not review an import of about
+2,000 lines line by line. Before touching, the operator checks:
+
+- the upstream commit: `git-subtree-split` is the peeled commit of the signed
+  upstream release tag;
+- the lint result: `test/lint/libbitcoinpqc-subtree-check.sh` reports `GOOD`,
+  which compares the vendored tree with the upstream tree;
+- the pin test: every pin location names the new tag, and the tests that read
+  those pins pass.
+
+A fork pull request that touches `src/libbitcoinpqc` is not merged or
+recreated from the fork: a maintainer re-imports the release in a branch of
+this repository.
+
 ## Verify Subtree Integrity
 
 After importing, verify that the qbit subtree exactly matches the upstream
@@ -190,6 +221,13 @@ operator-01's pinned signing key and the tag's own header, should report
 `1965d0da1eb4d9e196613b8f3a5d0d866a221c53` for the current pin. It fetches
 the whole upstream history, which is small, because a `--depth` fetch would
 mark the qbit checkout shallow.
+
+The check's search for the newest import commit, described in
+[Refresh The Subtree](#refresh-the-subtree), walks every parent, not only the
+first. A squash merge lands the import's trailers on the commit it adds to the
+branch, but where a merge commit brings the import in, such as a merge of one
+line into another, the import commit is the merge's second parent, and a
+`--first-parent` search would skip it.
 
 The current qbit tree carries no downstream delta: `HEAD:src/libbitcoinpqc`
 must equal the tagged upstream tree. Since `v0.3.1`, upstream contains the

@@ -125,6 +125,7 @@ add_executable(test_bitcoin
   torcontrol_tests.cpp
   transaction_tests.cpp
   translation_tests.cpp
+  tx_validation_budget_tests.cpp
   txdownload_tests.cpp
   txgraph_tests.cpp
   txindex_tests.cpp
