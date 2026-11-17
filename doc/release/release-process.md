@@ -672,17 +672,18 @@ immutable, the publisher cannot roll the release back.
   in this order:
   1. an Actions event policy allows `pull_request_target` for the workflow,
      before 2026-12-02;
-  2. the `main` and `1.x.x` rulesets require their per-base checks,
+  2. `@Qbit-Org/release-maintainers` gets write access, so `CODEOWNERS`
+     applies: code-owner review is what covers the workflows and CI scripts
+     the gate asks no signatures for;
+  3. the `main` and `1.x.x` rulesets require their per-base checks,
      `Key Policy Gate (main)` and `Key Policy Gate (1.x.x)`, from GitHub
      Actions (integration 15368), with code-owner review and up-to-date
-     branches, as `.github/rulesets/` describes;
-  3. `@Qbit-Org/release-maintainers` gets write access, so `CODEOWNERS`
-     applies.
+     branches, as `.github/rulesets/` describes.
 
   No ruleset may require the gate before `main` has the workflow: until then
   no run posts the check, and pull requests would wait for it forever. Pull
   requests already open into `main` or `1.x.x` get a gate run only on their
-  next event, so after step 2 push to, edit or reopen each one that shows
+  next event, so after step 3 push to, edit or reopen each one that shows
   the check as expected but missing. If
   v1.0.1 has not reached `main` well before 2026-12-02, raise the deadline
   with the operator.
