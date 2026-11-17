@@ -101,11 +101,11 @@ The publisher's `trusted_release_ref` is only defined after staging, so the
 staging steps use their own pinned ref:
 
 1. Before staging, the coordinator pins `STAGING_REF`: the full SHA of a public
-   commit on the release branch that contains these tools and descends from the
-   release tag target, and records it in the release issue. Staging, every
-   signature and the combination all run with
-   `--trusted-release-ref "$STAGING_REF"`, from a checkout that has the release
-   tag:
+   commit on the release branch's first-parent history that contains these
+   tools and has the release tag target on its own first-parent history, and
+   records it in the release issue. Staging, every signature and the
+   combination all run with `--trusted-release-ref "$STAGING_REF"`, from a
+   checkout that has the release tag:
 
    ```sh
    git fetch --tags origin
