@@ -350,7 +350,7 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
         repo.mkdir()
         env = os.environ.copy()
         env["GNUPGHOME"] = str(self.secret_home)
-        subprocess.run([GIT, "init"], cwd=repo, check=True, capture_output=True, text=True)
+        subprocess.run([GIT, "init", "-b", "main"], cwd=repo, check=True, capture_output=True, text=True)
         subprocess.run(
             [GIT, "config", "user.name", "qbit test"],
             cwd=repo,
@@ -849,7 +849,8 @@ class ReleasePublisherBoundaryTest(unittest.TestCase):
         self.assertIn('"$remote_verification_reason" = valid', publisher)
         self.assertIn("verify_remote_tag_pin pre-publication", publisher)
         self.assertIn("verify_remote_tag_pin post-publication", publisher)
-        self.assertIn("merge-base --is-ancestor", publisher)
+        self.assertIn('on_first_parent_history "$TRUSTED_ROOT" "$TRUSTED_RELEASE_REF" "$TAG_TARGET"', publisher)
+        self.assertIn("protected_branch_tip", publisher)
         self.assertIn("ci/release/validate_release_artifacts.py", publisher)
         self.assertIn("ci/release/verify_mainnet_release_posture.py", publisher)
         self.assertIn("ci/release/verify_testnet_release_posture.py", publisher)
