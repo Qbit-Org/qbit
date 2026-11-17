@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -524,8 +525,11 @@ def test_release_builds_default_mainnet_guard_off():
 
         job_start = workflow.index("  mainnet-publish-gate:")
         job = workflow[job_start : workflow.index("  core-checks-gate:", job_start)]
+        # The same-tree skip may skip the job, but only on a pull request run
+        # whose tree already passed it; see the next test.
         self.assertIn(
-            "if: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required == 'true' }}",
+            "    if: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required == 'true'"
+            " && needs.classify-changes.outputs.tree_pass_skip != 'true' }}\n",
             job,
         )
         self.assertNotIn("source_validation_required", job)
@@ -543,10 +547,15 @@ def test_release_builds_default_mainnet_guard_off():
         self.assertIn("- mainnet-publish-gate", workflow)
 
         # The values the release-target rule gets, and where its answer goes.
+        release_target = self.step_block(workflow, "Classify release target")
         for line in (
-            "      mainnet_publish_gate_required: ${{ steps.release-target.outputs.mainnet_publish_gate_required }}\n",
             "          TARGET_REF: ${{ github.base_ref || github.event.merge_group.base_ref || github.ref }}\n",
             "          VALIDATION_PROFILE: ${{ steps.classify.outputs.profile }}\n",
+        ):
+            with self.subTest(line=line.strip()):
+                self.assertEqual(release_target.count(line), 1)
+        for line in (
+            "      mainnet_publish_gate_required: ${{ steps.release-target.outputs.mainnet_publish_gate_required }}\n",
             "          MAINNET_PUBLISH_GATE_REQUIRED: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required }}\n",
             "          MAINNET_PUBLISH_GATE_RESULT: ${{ needs.mainnet-publish-gate.result }}\n",
         ):
@@ -554,13 +563,79 @@ def test_release_builds_default_mainnet_guard_off():
                 self.assertEqual(workflow.count(line), 1)
 
         # The gate checks the posture result before it may stop early for a
-        # profile without source checks.
+        # profile without source checks. check_job accepts a skipped job only
+        # on a same-tree skip, which only a pull request run can have.
         self.assertLess(
-            workflow.index('check_result "mainnet publication posture"'),
+            workflow.index('check_job "mainnet publication posture" "${MAINNET_PUBLISH_GATE_RESULT}"'),
             workflow.index('if [[ "${SOURCE_VALIDATION_REQUIRED}" != "true" ]]'),
         )
         release_policy_case = required_gate.split("release-policy)", 1)[1].split(";;", 1)[0]
         self.assertIn('wait_for_checks "Core Checks Gate"', release_policy_case)
+
+    def test_the_same_tree_skip_is_false_outside_pull_requests(self) -> None:
+        # Core Checks runs on pull_request, branch push and merge_group events,
+        # not on tag pushes. Whatever the event, tree_pass_skip can be 'true'
+        # only on a pull_request run, so a push or merge_group run, or a tag
+        # push if one is ever added, always runs the real posture gate.
+        workflow = CORE_CHECKS.read_text(encoding="utf8")
+
+        # 'true' only from a decision step that ran and succeeded ...
+        self.assertEqual(
+            workflow.count(
+                "      tree_pass_skip: ${{ steps.marker-decision.outcome == 'success'"
+                " && steps.marker-decision.outputs.skip == 'true' && 'true' || 'false' }}\n"
+            ),
+            1,
+        )
+        self.assertEqual(workflow.count("tree_pass_skip:"), 1)
+        # ... which runs only for a pull_request event (a skipped step's
+        # outcome is 'skipped') ...
+        self.assertEqual(workflow.count("        id: marker-decision\n"), 1)
+        step = self.step_block(workflow, "Decide whether this tree already passed")
+        self.assertIn("        id: marker-decision\n", step)
+        self.assertIn("        if: github.event_name == 'pull_request'\n", step)
+        self.assertIn("python3 ci/checks/tree_pass_marker.py decide \\\n", step)
+        self.assertIn('--event "${EVENT_NAME}"', step)
+        self.assertIn("          EVENT_NAME: ${{ github.event_name }}\n", step)
+
+        # ... and which itself never skips for another event.
+        for event in ("push", "merge_group", "workflow_dispatch", "create", ""):
+            with self.subTest(event=event):
+                output = self.root / f"decide-{event or 'empty'}"
+                output.write_text("", encoding="utf8")
+                args = [sys.executable, str(REPO_ROOT / "ci" / "checks" / "tree_pass_marker.py"), "decide"]
+                for name in (
+                    "labels-json", "profile", "key-outcome", "key-prefix", "head-tree", "workflow-path",
+                    "lookup-outcome", "matched-key", "run-id", "run-attempt", "repository",
+                    "head-repository-id", "head-ref", "head-owner", "pr-number", "gate-job", "save-job",
+                ):
+                    args += [f"--{name}", "x"]
+                args += ["--event", event, "--github-output", str(output)]
+                subprocess.run(args, check=True, capture_output=True, env={"PATH": "/usr/bin:/bin"})
+                # The event alone decides, before any other input is read.
+                self.assertEqual(
+                    output.read_text(encoding="utf8"),
+                    f"reason=a {event} event always runs in full\nskip=false\n",
+                )
+
+        # Should a skip still reach another event, the gate fails rather than
+        # accept the skipped posture gate.
+        gate = self.step_script(workflow, "Check core check results")
+        self.assertIn(
+            'if [[ "${TREE_PASS_SKIP}" == "true" ]]; then\n'
+            '  if [[ "${EVENT_NAME}" != "pull_request" ]]; then\n',
+            gate,
+        )
+        self.assertIn("only pull requests skip.\"\n    exit 1\n", gate)
+        self.assertIn('if [[ "${marker_skip}" == "true" && "$2" == "skipped" ]]; then\n', gate)
+
+    @staticmethod
+    def step_block(workflow: str, step_name: str) -> str:
+        """The named step, from its name line up to the next step or job."""
+
+        start = workflow.index(f"      - name: {step_name}\n")
+        end = re.compile(r"^(      - name: |  [^ \n])", re.MULTILINE).search(workflow, start + 1)
+        return workflow[start : end.start() if end else len(workflow)]
 
     @staticmethod
     def step_script(workflow: str, step_name: str) -> str:

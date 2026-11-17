@@ -1034,9 +1034,21 @@ class BranchRulesetStepTest(unittest.TestCase):
         return run_bash_step(self.script, rulesets.parent.parent, env)
 
     def copy_rulesets(self, root: Path) -> Path:
+        # The step also reads the merge-method settings beside the rulesets.
         rulesets = root / ".github" / "rulesets"
         shutil.copytree(REPO_ROOT / ".github" / "rulesets", rulesets)
+        shutil.copytree(REPO_ROOT / ".github" / "repository-settings", root / ".github" / "repository-settings")
         return rulesets
+
+    def edit_json(self, path: Path, edit) -> None:
+        data = json.loads(path.read_text(encoding="utf8"))
+        edit(data)
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf8")
+
+    def assert_step_fails(self, rulesets: Path, message: str) -> None:
+        result = self.run_step(rulesets)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(message, result.stdout + result.stderr)
 
     def test_the_templates_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1055,6 +1067,123 @@ class BranchRulesetStepTest(unittest.TestCase):
                 result = self.run_step(rulesets)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("require_extra_approval_for_unattributed_changes must be true", result.stdout + result.stderr)
+
+    def test_the_merge_methods_must_be_squash_and_merge(self) -> None:
+        def set_methods(methods):
+            def edit(data):
+                for rule in data["rules"]:
+                    if rule["type"] == "pull_request":
+                        rule["parameters"]["allowed_merge_methods"] = methods
+            return edit
+
+        for name in ("main.json", "1.x.x.json", "1.0.0.json", "0.1.x.json"):
+            with self.subTest(template=name, methods="squash, merge"), tempfile.TemporaryDirectory() as tmp:
+                rulesets = self.copy_rulesets(Path(tmp))
+                self.edit_json(rulesets / name, set_methods(["squash", "merge"]))
+                result = self.run_step(rulesets)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for methods in (["merge"], ["squash"], ["merge", "squash", "rebase"], None):
+                with self.subTest(template=name, methods=methods), tempfile.TemporaryDirectory() as tmp:
+                    rulesets = self.copy_rulesets(Path(tmp))
+                    self.edit_json(rulesets / name, set_methods(methods))
+                    self.assert_step_fails(rulesets, "allowed merge methods must be merge and squash")
+
+    def test_a_template_requiring_linear_history_fails(self) -> None:
+        for name in ("main.json", "1.x.x.json", "1.0.0.json", "0.1.x.json"):
+            with self.subTest(template=name), tempfile.TemporaryDirectory() as tmp:
+                rulesets = self.copy_rulesets(Path(tmp))
+                self.edit_json(rulesets / name, lambda data: data["rules"].append({"type": "required_linear_history"}))
+                self.assert_step_fails(rulesets, "required_linear_history must be absent")
+
+    def test_no_branch_ruleset_requires_signed_landing(self) -> None:
+        for name in ("main.json", "1.x.x.json", "1.0.0.json", "0.1.x.json"):
+            with self.subTest(template=name), tempfile.TemporaryDirectory() as tmp:
+                rulesets = self.copy_rulesets(Path(tmp))
+
+                def add(data):
+                    for rule in data["rules"]:
+                        if rule["type"] == "required_status_checks":
+                            rule["parameters"]["required_status_checks"].append(
+                                {"context": "signed-landing", "integration_id": 15368}
+                            )
+
+                self.edit_json(rulesets / name, add)
+                self.assert_step_fails(rulesets, "required status checks must be")
+
+    def test_required_checks_holds_signed_landing_where_nobody_can_bypass_it(self) -> None:
+        def rule(data, kind):
+            return next(r for r in data["rules"] if r["type"] == kind)
+
+        def checks(value):
+            return lambda data: rule(data, "required_status_checks")["parameters"].__setitem__(
+                "required_status_checks", value
+            )
+
+        def pull_request(key, value):
+            return lambda data: rule(data, "pull_request")["parameters"].__setitem__(key, value)
+
+        def status(key, value):
+            return lambda data: rule(data, "required_status_checks")["parameters"].__setitem__(key, value)
+
+        def include(value):
+            return lambda data: data["conditions"]["ref_name"].__setitem__("include", value)
+
+        admin = {"actor_id": None, "actor_type": "OrganizationAdmin", "bypass_mode": "always"}
+        cases = {
+            "an admin bypass": (lambda data: data.__setitem__("bypass_actors", [admin]), "bypass_actors must be empty"),
+            "a pull request bypass": (
+                lambda data: data.__setitem__("bypass_actors", [dict(admin, bypass_mode="pull_request")]),
+                "bypass_actors must be empty",
+            ),
+            "no bypass_actors key": (lambda data: data.pop("bypass_actors"), "bypass_actors must be empty"),
+            "evaluate enforcement": (lambda data: data.__setitem__("enforcement", "evaluate"), "must be the active"),
+            "another name": (lambda data: data.__setitem__("name", "signed-landing"), "must be the active"),
+            "a check from any app": (checks([{"context": "signed-landing"}]), "exactly signed-landing"),
+            "a check from another app": (
+                checks([{"context": "signed-landing", "integration_id": 1}]), "exactly signed-landing"
+            ),
+            "a second check": (
+                checks([{"context": "signed-landing", "integration_id": 15368}, {"context": "Required Merge Gate"}]),
+                "exactly signed-landing",
+            ),
+            "no check": (checks([]), "exactly signed-landing"),
+            "a strict check": (status("strict_required_status_checks_policy", True), "must not be strict"),
+            "enforced on creation": (status("do_not_enforce_on_create", False), "must not be strict"),
+            "without 0.1.x": (include(["refs/heads/1.x.x", "refs/heads/1.0.0"]), "must target exactly"),
+            "with main": (
+                include(["refs/heads/1.x.x", "refs/heads/1.0.0", "refs/heads/0.1.x", "refs/heads/main"]),
+                "must target exactly",
+            ),
+            "an exclusion": (
+                lambda data: data["conditions"]["ref_name"].__setitem__("exclude", ["refs/heads/0.1.x"]),
+                "must target exactly",
+            ),
+            "no pull request rule": (
+                lambda data: data.__setitem__("rules", [rule(data, "required_status_checks")]),
+                "rules must be exactly",
+            ),
+            "a third rule": (lambda data: data["rules"].append({"type": "deletion"}), "rules must be exactly"),
+            "one approval": (pull_request("required_approving_review_count", 1), "must require no approval"),
+            "squash only": (pull_request("allowed_merge_methods", ["squash"]), "allowed merge methods"),
+        }
+        for case, (edit, message) in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                rulesets = self.copy_rulesets(Path(tmp))
+                self.edit_json(rulesets / "required-checks.json", edit)
+                self.assert_step_fails(rulesets, message)
+
+    def test_the_merge_method_settings_must_allow_squash_and_merge_only(self) -> None:
+        for key, value in (
+            ("allow_squash_merge", False),
+            ("allow_merge_commit", False),
+            ("allow_rebase_merge", True),
+            ("allow_auto_merge", True),
+        ):
+            with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as tmp:
+                rulesets = self.copy_rulesets(Path(tmp))
+                settings = rulesets.parent / "repository-settings" / "merge-methods.json"
+                self.edit_json(settings, lambda data: data.__setitem__(key, value))
+                self.assert_step_fails(rulesets, "merge-methods.json: must be")
 
 
 if __name__ == "__main__":

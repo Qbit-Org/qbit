@@ -1314,6 +1314,30 @@ class TrustedCheckoutHardeningTest(ReleaseToolTestCase):
         )
         self.assert_fails(result, f"target {unrelated} is not an ancestor of the trusted release ref")
 
+    def test_a_tag_on_a_merged_pull_request_head_is_refused(self) -> None:
+        # The tag target is an ancestor of the trusted ref, but only through
+        # the merge's second parent: the publisher would refuse it, so staging
+        # does too, before anyone signs.
+        trusted = self.release.trusted
+        base = self.release.ref
+        tree = f"{base}^{{tree}}"
+        head = git(trusted, "commit-tree", tree, "-p", base, "-m", "pull request head")
+        moved = git(trusted, "commit-tree", tree, "-p", base, "-m", "branch moved on")
+        merge = git(trusted, "commit-tree", tree, "-p", moved, "-p", head, "-m", "Merge pull request #1")
+        git(trusted, "tag", "-a", "v2.0.0-testnet1", "-m", "v2.0.0-testnet1", head)
+        git(trusted, "checkout", "-q", "--detach", merge)
+        git(trusted, "merge-base", "--is-ancestor", head, merge)
+        self.release.ref = merge
+        (self.release.guix_sigs / "2.0.0-testnet1").mkdir()
+        result = self.release.run(
+            STAGE_TOOL, "--tag", "v2.0.0-testnet1", "--guix-sigs-dir", str(self.release.guix_sigs),
+            "--sha256sums-output", str(self.root / "derived" / "SHA256SUMS"),
+        )
+        self.assert_fails(
+            result,
+            f"target {head} is an ancestor of the trusted release ref {merge} but not on its first-parent history",
+        )
+
     def derive_sha256sums(self) -> subprocess.CompletedProcess[str]:
         derived = self.root / "derived" / "SHA256SUMS"
         derived.unlink(missing_ok=True)
