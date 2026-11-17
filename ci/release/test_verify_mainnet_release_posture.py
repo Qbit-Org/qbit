@@ -544,7 +544,8 @@ def test_release_builds_default_mainnet_guard_off():
         )
         self.assertNotIn("continue-on-error", job)
         self.assertNotIn("mainnet_ci_posture", workflow + required_gate)
-        self.assertIn("- mainnet-publish-gate", workflow)
+        gate_job = workflow[workflow.index("  core-checks-gate:\n") : workflow.index("  save-pass-marker:\n")]
+        self.assertIn("      - mainnet-publish-gate\n", gate_job)
 
         # The values the release-target rule gets, and where its answer goes.
         release_target = self.step_block(workflow, "Classify release target")
@@ -562,13 +563,47 @@ def test_release_builds_default_mainnet_guard_off():
             with self.subTest(line=line.strip()):
                 self.assertEqual(workflow.count(line), 1)
 
-        # The gate checks the posture result before it may stop early for a
-        # profile without source checks. check_job accepts a skipped job only
-        # on a same-tree skip, which only a pull request run can have.
-        self.assertLess(
-            workflow.index('check_job "mainnet publication posture" "${MAINNET_PUBLISH_GATE_RESULT}"'),
-            workflow.index('if [[ "${SOURCE_VALIDATION_REQUIRED}" != "true" ]]'),
+        # The gate checks the posture result, whenever it is required, before
+        # it may stop early for a profile without source checks, and stopping
+        # early still fails the gate when a check has failed.
+        gate = self.step_script(gate_job, "Check core check results")
+        self.assertIn(
+            'if [[ "${MAINNET_PUBLISH_GATE_REQUIRED}" == "true" ]]; then\n'
+            '  check_job "mainnet publication posture" "${MAINNET_PUBLISH_GATE_RESULT}"\n'
+            "else\n"
+            '  echo "Mainnet publication posture is not required for this target/profile."\n'
+            "fi\n"
+            "\n"
+            'if [[ "${SOURCE_VALIDATION_REQUIRED}" != "true" ]]; then\n'
+            '  echo "Validation profile ${VALIDATION_PROFILE} does not require source core checks."\n'
+            '  exit "${failed}"\n'
+            "fi\n",
+            gate,
         )
+        # Only success passes, and check_job, defined once, lets a skipped job
+        # pass only where the gate's own marker_skip says so.
+        for function in (
+            "check_result() {\n"
+            '  local name="$1"\n'
+            '  local result="$2"\n'
+            "\n"
+            '  echo "${name}: ${result}"\n'
+            '  if [[ "${result}" != "success" ]]; then\n'
+            '    echo "::error title=Core Checks failed::${name} result was ${result}."\n'
+            "    failed=1\n"
+            "  fi\n"
+            "}\n",
+            "check_job() {\n"
+            '  if [[ "${marker_skip}" == "true" && "$2" == "skipped" ]]; then\n'
+            '    echo "$1: skipped, this tree already passed Core Checks"\n'
+            "    return 0\n"
+            "  fi\n"
+            '  check_result "$1" "$2"\n'
+            "}\n",
+        ):
+            with self.subTest(function=function.split("(")[0]):
+                self.assertEqual(gate.count(function.split("\n")[0]), 1)
+                self.assertIn(function, gate)
         release_policy_case = required_gate.split("release-policy)", 1)[1].split(";;", 1)[0]
         self.assertIn('wait_for_checks "Core Checks Gate"', release_policy_case)
 

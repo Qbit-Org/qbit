@@ -7,9 +7,10 @@
 The `pull_request_target` job's check step is lifted out of
 .github/workflows/key-policy-gate.yml and run in a checkout of a scratch
 repository's base commit, with the pull request's commits present only as git
-objects. A pull request that changes the gate's own code, the classifier or a
-validator is checked by the base's copies, and needs approvals by the base
-policy's signers over a manifest of the gate's files.
+objects. A pull request that changes the gate's own code (its workflow, its
+script or the validator) is checked by the base's copies, and needs approvals
+by the base policy's signers over a manifest of those files. Other workflows
+and attribute files are checked by the gate without approvals.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ if str(CHECKS_DIR) not in sys.path:
     sys.path.insert(0, str(CHECKS_DIR))
 
 import test_key_policy_gate_contract as contract  # noqa: E402
+from test_key_policy_gate_contract import CLASSIFIER  # noqa: E402
 from test_classifier_ci_contract import REPO_ROOT, WorkflowLoader, run_bash_step  # noqa: E402
 
 sys.path.insert(0, str(REPO_ROOT / "ci" / "release"))
@@ -128,15 +130,57 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         self.commit("change the validator")
         self.assert_target_refused("this change to the gate's code needs contrib/keys/gate-approvals/")
 
-    def test_target_requires_approvals_for_a_classifier_change(self) -> None:
-        self.edit("ci/checks/classify_merge_profile.py")
-        self.commit("change the classifier")
-        self.assert_target_refused("Gate code changed: ci/checks/classify_merge_profile.py")
+    GATE_CODE = (".github/workflows/key-policy-gate.yml", "ci/release/key_policy_gate.py", "ci/release/validate_key_metadata.py")
 
-    def test_target_requires_approvals_for_a_workflow_change(self) -> None:
+    def test_the_gates_code_is_three_files(self) -> None:
+        self.assertEqual(key_policy_gate.GATE_CODE_PATHS, self.GATE_CODE)
+
+    def test_target_requires_approvals_for_each_file_of_the_gates_code(self) -> None:
+        for path in self.GATE_CODE:
+            with self.subTest(path=path):
+                self.git("checkout", "--quiet", "-B", f"gate-code-{len(path)}", self.base)
+                if path == key_policy_gate.GATE_WORKFLOW:
+                    (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(TARGET_WORKFLOW, self.repo / path)
+                else:
+                    self.edit(path)
+                self.commit("change the gate's code")
+                result = self.run_target()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"Gate code changed: {path}", result.stdout)
+                self.assertIn("this change to the gate's code needs contrib/keys/gate-approvals/", result.stdout)
+
+    def test_target_passes_files_beside_the_gates_code_without_approvals(self) -> None:
+        # Code owners review these; the gate neither loads nor runs them.
+        for index, path in enumerate((
+            "ci/checks/classify_merge_profile.py",
+            "ci/checks/test_key_policy_gate_target.py",
+            "ci/checks/data/fixture.json",
+            "ci/release/validate_release_artifacts.py",
+            "ci/release/notes.txt",
+            ".github/actions/setup/action.yml",
+            ".github/CODEOWNERS",
+            "CODEOWNERS",
+            "docs/CODEOWNERS",
+            "contrib/keys/README.md",
+        )):
+            with self.subTest(path=path):
+                self.git("checkout", "--quiet", "-B", f"beside-{index}", self.base)
+                self.edit(path, "# data\n")
+                self.commit("a file beside the gate's code")
+                result = self.run_target()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("No key policy or gate code path changed", result.stdout)
+                self.assertNotIn("Gate code changed", result.stdout)
+
+    def test_target_checks_a_workflow_change_without_approvals(self) -> None:
         self.edit(".github/workflows/required-merge-gate.yml", "name: Required Merge Gate\npermissions: {}\n")
         self.commit("change the workflow")
-        self.assert_target_refused("this change to the gate's code needs")
+        result = self.run_target()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Workflows changed: .github/workflows/required-merge-gate.yml", result.stdout)
+        self.assertIn("No key policy or gate code path changed", result.stdout)
+        self.assertNotIn("Gate code changed", result.stdout)
 
     def test_target_refuses_the_first_of_two_pull_requests_weakening_the_validator(self) -> None:
         # A validator that accepts any policy change: the base's code refuses the change itself.
@@ -236,10 +280,12 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         self.assertIn("validate_key_metadata.py refused the change", result.stdout)
 
     def test_target_loads_its_modules_from_their_own_files(self) -> None:
-        # A file named like one of the gate's modules, in the other module's
-        # directory in the base, must not be loaded instead.
+        # A file named like the gate's module in another directory in the
+        # base, or like a module the gate no longer loads beside it, must not
+        # be loaded.
         for directory, name in (("ci/release", "classify_merge_profile.py"), ("ci/checks", "validate_key_metadata.py")):
             (self.repo / directory / name).write_text("raise SystemExit(0)\n", encoding="utf8")
+        (self.repo / CLASSIFIER).write_text("raise SystemExit('the classifier was loaded')\n", encoding="utf8")
         self.commit("files named like the gate's modules")
         self.land()
         self.edit("ci/release/validate_key_metadata.py")
@@ -365,14 +411,6 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
                 self.commit("bytecode")
                 self.assert_target_refused(f"Python bytecode caches may not be committed: {path}")
 
-    def test_target_treats_any_file_under_the_gate_directories_as_gate_code(self) -> None:
-        for path in ("ci/release/notes.txt", "ci/checks/data/fixture.json", ".github/actions/setup/script.sh"):
-            with self.subTest(path=path):
-                self.git("checkout", "--quiet", "-B", f"gate-file-{len(path)}", self.base)
-                self.edit(path, "data\n")
-                self.commit("a file under the gate's directories")
-                self.assert_target_refused(f"Gate code changed: {path}")
-
     def test_target_needs_each_release_lines_quorum_for_a_gate_change(self) -> None:
         data = self.policy_data(3, ["operator-01", "operator-02", "operator-04"], self.policies[2])
         data["release_lines"]["mainnet"] = dict(data["release_lines"]["testnet"], active_signer_set_size=1, release_signature_quorum=1, builder_attestation_quorum=1, policy_change_quorum=1)
@@ -423,37 +461,55 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         self.approve_gate_change(["operator-01", "operator-02"])
         self.assert_target_accepted("gate change approved by operator-01, operator-02")
 
-    def test_target_treats_attribute_files_as_gate_code(self) -> None:
-        for path, rule in ((".gitattributes", "doc/*.md text eol=lf\n"), ("doc/.gitattributes", "*.md text eol=lf\n")):
+    def test_target_checks_attribute_files_without_approvals(self) -> None:
+        # An attribute file is not gate code: the gate checks what it does to
+        # the policy's files and to its own, and passes the rest.
+        for path, rule in (
+            (".gitattributes", "doc/*.md text eol=lf\n"),
+            ("doc/.gitattributes", "*.md text eol=lf\n"),
+            # A subtree's .gitattributes may match itself.
+            ("src/vendored/.gitattributes", "* text=auto\n"),
+        ):
             with self.subTest(path=path):
                 self.git("checkout", "--quiet", "-B", f"attributes-{len(path)}", self.base)
                 self.edit(path, rule)
-                self.commit("attributes for documents")
-                self.assert_target_refused(f"Gate code changed: {path}")
-                self.approve_gate_change(["operator-01", "operator-02"])
-                self.assert_target_accepted("gate change approved by operator-01, operator-02")
+                self.commit("attributes for other files")
+                result = self.run_target()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"Key policy paths changed: {path}", result.stdout)
+                self.assertNotIn("Gate code changed", result.stdout)
 
-    def test_target_leaves_attribute_files_own_attributes_alone(self) -> None:
-        # A subtree's .gitattributes may match itself: it is approved, not checked out by the gate.
-        self.edit("src/vendored/.gitattributes", "* text=auto\n")
-        self.commit("a vendored tree's attributes")
+    def test_target_checks_attributes_already_in_the_base_on_a_gate_change(self) -> None:
+        # The rule landed without the gate; no attribute file changes with the gate change.
+        self.edit(".gitattributes", "ci/release/*.py eol=crlf\n")
+        self.commit("attributes for the gate's code, landed without the gate")
+        self.land()
+        self.edit("ci/release/key_policy_gate.py")
+        self.commit("change the gate")
         self.approve_gate_change(["operator-01", "operator-02"])
-        self.assert_target_accepted("gate change approved by operator-01, operator-02")
-
-    def test_target_refuses_attributes_on_case_variants_of_the_gates_code(self) -> None:
-        self.edit("CI/release/x.py", "print('x')\n")
-        self.edit(".gitattributes", "CI/** eol=crlf\n")
-        self.commit("attributes for gate code in other letters")
-        self.approve_gate_change(["operator-01", "operator-02"])
-        self.assert_target_refused("CI/release/x.py has the eol attribute (crlf)")
+        self.assert_target_refused("ci/release/key_policy_gate.py has the eol attribute (crlf)")
 
     def test_target_refuses_attributes_on_the_gates_code(self) -> None:
-        self.edit(".gitattributes", "ci/release/*.py working-tree-encoding=UTF-16LE\n")
-        self.commit("attributes for the gate's code")
-        self.assert_target_refused("Gate code changed: .gitattributes")
-        self.approve_gate_change(["operator-01", "operator-02"])
-        self.assert_target_refused("has the working-tree-encoding attribute (UTF-16LE)")
-        self.assertIn("No .gitattributes rule may set this attribute for the gate's code", self.run_target().stdout)
+        # Whatever attribute file sets them, and with no approvals asked for: none could allow it.
+        for index, (path, rule) in enumerate((
+            (".gitattributes", "ci/release/*.py working-tree-encoding=UTF-16LE\n"),
+            (".gitattributes", "ci/release/key_policy_gate.py eol=crlf\n"),
+            (".gitattributes", "*.py text\n"),
+            (".gitattributes", "ci/release/validate_key_metadata.py ident\n"),
+            # A macro and its use.
+            (".gitattributes", "[attr]plain text eol=crlf\nci/release/key_policy_gate.py plain\n"),
+            ("ci/.gitattributes", "release/key_policy_gate.py working-tree-encoding=UTF-16LE\n"),
+            ("ci/release/.gitattributes", "validate_key_metadata.py working-tree-encoding=UTF-16LE\n"),
+        )):
+            with self.subTest(path=path, rule=rule):
+                self.git("checkout", "--quiet", "-B", f"gate-attributes-{index}", self.base)
+                self.edit(path, rule)
+                self.commit("attributes for the gate's code")
+                result = self.run_target()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertRegex(result.stdout, r"ci/release/\w+\.py has the (working-tree-encoding|eol|text|ident) attribute")
+                self.assertIn("No .gitattributes rule may set this attribute for the gate's code", result.stdout)
+                self.assertNotIn("needs contrib/keys/gate-approvals/", result.stdout)
 
     def test_target_refuses_the_gates_name_in_any_yaml_form(self) -> None:
         forms = {
@@ -518,7 +574,6 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
                 workflow.parent.mkdir(parents=True, exist_ok=True)
                 workflow.write_text(text, encoding="utf8")
                 self.commit(f"another workflow: {name}")
-                self.approve_gate_change(["operator-01", "operator-02"])
                 self.assert_target_refused(expected)
 
     def test_target_accepts_other_names_and_read_only_permissions(self) -> None:
@@ -537,14 +592,18 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             encoding="utf8",
         )
         self.commit("another workflow")
-        self.approve_gate_change(["operator-01", "operator-02"])
-        self.assert_target_accepted("gate change approved by operator-01, operator-02")
+        self.assert_target_accepted("No key policy or gate code path changed")
 
     def test_target_leaves_unchanged_workflows_permissions_to_the_base(self) -> None:
-        # A workflow already in the base keeps the default token permissions it had.
+        # A workflow already in the base keeps the default token permissions it had,
+        # whether the pull request changes the gate's code or another workflow.
         self.edit(".github/workflows/old.yml", "name: Old\njobs:\n  old:\n    runs-on: ubuntu-24.04\n")
         self.commit("a workflow without permissions")
         self.land()
+        self.edit(".github/workflows/new.yml", "name: New\npermissions: {}\njobs: {}\n")
+        self.commit("another workflow")
+        self.assert_target_accepted("No key policy or gate code path changed")
+        self.git("checkout", "--quiet", "-B", "gate-change", self.base)
         self.edit("ci/release/validate_key_metadata.py")
         self.commit("change the validator")
         self.approve_gate_change(["operator-01", "operator-02"])
@@ -554,41 +613,56 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         self.edit(".github/workflows/old.yml", "permissions: {}\njobs:\n  old:\n    name: >-\n      Key Policy\n      Gate\n")
         self.commit("a workflow named like the gate, from before the check read YAML")
         self.land()
+        self.edit(".github/workflows/new.yml", "name: New\npermissions: {}\njobs: {}\n")
+        self.commit("another workflow")
+        self.assert_target_refused(".github/workflows/old.yml names something 'Key Policy Gate'")
+        self.git("checkout", "--quiet", "-B", "gate-change", self.base)
         self.edit("ci/release/validate_key_metadata.py")
         self.commit("change the validator")
         self.approve_gate_change(["operator-01", "operator-02"])
         self.assert_target_refused(".github/workflows/old.yml names something 'Key Policy Gate'")
 
-    def test_target_treats_every_codeowners_file_as_gate_code(self) -> None:
-        for path in ("CODEOWNERS", "docs/CODEOWNERS", ".github/CODEOWNERS"):
-            with self.subTest(path=path):
-                self.git("checkout", "--quiet", "-B", f"codeowners-{len(path)}", self.base)
-                self.edit(path, "* @someone\n")
-                self.commit("code owners")
-                self.assert_target_refused(f"Gate code changed: {path}")
+    def test_target_leaves_workflows_alone_when_none_changes(self) -> None:
+        # The check reads workflows when a pull request changes one, or the
+        # gate's code: a name already in the base does not fail every other pull request.
+        self.edit(".github/workflows/old.yml", "permissions: {}\njobs:\n  old:\n    name: Key Policy Gate\n")
+        self.commit("a workflow named like the gate")
+        self.land()
+        self.edit("doc/notes.md", "Notes.\n")
+        self.commit("notes")
+        self.assert_target_accepted("No key policy or gate code path changed")
 
     def test_target_allows_archive_attributes_on_the_gates_code(self) -> None:
         # export-ignore changes git archive output, not the gate's checkout.
         self.edit(".gitattributes", "ci/** export-ignore\n.github/** export-ignore\n")
         self.commit("keep CI files out of archives")
-        self.approve_gate_change(["operator-01", "operator-02"])
-        self.assert_target_accepted("gate change approved by operator-01, operator-02")
+        self.assert_target_accepted("Key policy paths changed: .gitattributes")
 
     def test_target_reads_only_top_level_workflows(self) -> None:
         # GitHub reads workflows only from the top of .github/workflows/.
         self.edit(".github/workflows/data/matrix.yml", "- one\n- two\n")
         self.commit("data beside the workflows")
-        self.approve_gate_change(["operator-01", "operator-02"])
-        self.assert_target_accepted("gate change approved by operator-01, operator-02")
+        self.assert_target_accepted("No key policy or gate code path changed")
 
-    def test_target_handles_gate_paths_that_are_not_utf8(self) -> None:
-        (self.repo / "ci" / "checks").mkdir(parents=True, exist_ok=True)
-        path = os.path.join(os.fsencode(self.repo), b"ci", b"checks", b"data-\xff.txt")
-        with open(path, "wb") as handle:
-            handle.write(b"data\n")
-        self.commit("a file with a name that is not UTF-8")
-        # Refused, not crashed: a signer could not read such a path in the manifest.
-        self.assert_target_refused("a gate path may hold only printable characters")
+    def test_target_refuses_a_workflow_that_is_not_a_regular_file(self) -> None:
+        self.edit("tools/other.yml", "permissions: {}\njobs: {}\n")
+        workflow = self.repo / ".github" / "workflows" / "other.yml"
+        workflow.parent.mkdir(parents=True, exist_ok=True)
+        workflow.symlink_to("../../tools/other.yml")
+        self.commit("a workflow behind a symlink")
+        self.assert_target_refused(".github/workflows/other.yml is not a regular file (mode 120000)")
+
+    def test_target_handles_paths_that_are_not_utf8(self) -> None:
+        # Not gate code, and not a crash: such a name is printed escaped where it is printed at all.
+        for directory, expected in ((b"ci/checks", "No key policy or gate code path changed"), (b".github/workflows", "Workflows changed: .github/workflows/data-\\udcff.txt")):
+            with self.subTest(directory=directory):
+                self.git("checkout", "--quiet", "-B", f"not-utf8-{len(directory)}", self.base)
+                (self.repo / os.fsdecode(directory)).mkdir(parents=True, exist_ok=True)
+                path = os.path.join(os.fsencode(self.repo), directory, b"data-\xff.txt")
+                with open(path, "wb") as handle:
+                    handle.write(b"data\n")
+                self.commit("a file with a name that is not UTF-8")
+                self.assert_target_accepted(expected)
 
     def test_target_matches_names_of_many_computed_pieces_quickly(self) -> None:
         # Forty computed pieces and a letter the check's name does not end with.
@@ -600,8 +674,7 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             encoding="utf8",
         )
         self.commit("a long computed name")
-        self.approve_gate_change(["operator-01", "operator-02"])
-        self.assert_target_accepted("gate change approved by operator-01, operator-02")
+        self.assert_target_accepted("No key policy or gate code path changed")
 
     def test_target_refuses_two_directory_entries_of_one_name(self) -> None:
         # A second ci/ entry with other files: no file path repeats, but a checkout holds only one.
@@ -619,15 +692,18 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         workflow.parent.mkdir(parents=True, exist_ok=True)
         workflow.write_text("permissions: {}\nlist: [&b {<<: {x: 1}, x: 2}]\nc: {<<: *b}\njobs: {}\n", encoding="utf8")
         self.commit("a workflow with merge keys")
-        self.approve_gate_change(["operator-01", "operator-02"])
-        self.assert_target_accepted("gate change approved by operator-01, operator-02")
+        self.assert_target_accepted("No key policy or gate code path changed")
 
-    def test_target_refuses_format_characters_in_gate_paths(self) -> None:
-        # A right-to-left override shows a signer another name than the file's.
-        self.edit("ci/release/\u202eyp.etag", "data\n")
-        self.commit("a gate path with a format character")
-        self.approve_gate_change(["operator-01", "operator-02"], manifest=b"base  0\n")
-        self.assert_target_refused("a gate path may hold only printable characters")
+    def test_target_prints_no_workflow_command_from_a_workflows_name(self) -> None:
+        # A right-to-left override and a line break in the names of changed workflows.
+        self.edit(".github/workflows/\u202elmy.rehto", "data\n")
+        self.edit(".github/workflows/a\n::add-mask::b.yml", "permissions: {}\njobs: {}\n")
+        self.commit("workflows with odd names")
+        result = self.run_target()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertFalse(any(line.startswith("::add-mask::") for line in lines), result.stdout)
+        self.assertIn("Workflows changed: .github/workflows/a\\u000a::add-mask::b.yml, .github/workflows/\\u202elmy.rehto", lines)
 
     def test_target_prints_no_workflow_command_from_paths(self) -> None:
         self.edit("doc/__pycache__/a\n::add-mask::Key Policy Gate\n.pyc", "bytecode")
@@ -666,12 +742,23 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         self.assertTrue(all(index < resume for index in injected), result.stdout)
 
     def test_target_is_not_blocked_by_a_bad_entry_in_the_base(self) -> None:
-        # The base state is hashed as git lists it, so the change that removes the entry can land.
-        self.edit("ci/release/\u202eyp.etag", "data\n")
-        self.commit("a gate path a signer could not read, landed without the gate")
+        # A base whose workflow directory is a symlink, landed without the
+        # gate: the base state is hashed as git lists it, so the change that
+        # puts a directory there, with the gate's workflow, can be approved
+        # and land.
+        workflows = self.repo / ".github" / "workflows"
+        workflows.parent.mkdir(parents=True, exist_ok=True)
+        workflows.symlink_to("../tools")
+        self.commit("the workflow directory as a symlink, landed without the gate")
         self.land()
-        (self.repo / "ci" / "release" / "\u202eyp.etag").unlink()
-        self.commit("remove it")
+        workflows.unlink()
+        workflows.mkdir()
+        shutil.copy2(TARGET_WORKFLOW, workflows / "key-policy-gate.yml")
+        self.commit("a workflow directory, with the gate's workflow")
+        result = self.run_target()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Gate code changed: .github/workflows, .github/workflows/key-policy-gate.yml", result.stdout)
+        self.assertIn("this change to the gate's code needs contrib/keys/gate-approvals/", result.stdout)
         self.approve_gate_change(["operator-01", "operator-02"])
         self.assert_target_accepted("gate change approved by operator-01, operator-02")
 
@@ -696,13 +783,11 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         # -text and binary leave the checkout's bytes as they are.
         self.edit(".gitattributes", "ci/** -text\n*.png binary\n")
         self.commit("no conversion for gate files")
-        self.approve_gate_change(["operator-01", "operator-02"])
-        self.assert_target_accepted("gate change approved by operator-01, operator-02")
+        self.assert_target_accepted("Key policy paths changed: .gitattributes")
 
     def test_target_refuses_attributes_beside_the_policy(self) -> None:
         self.edit("contrib/keys/.gitattributes", "README.md text eol=crlf\n")
         self.commit("attributes beside the policy")
-        self.approve_gate_change(["operator-01", "operator-02"])
         self.assert_target_refused("contrib/keys holds only the policy, its README and gate approvals")
 
     def test_target_refuses_a_gate_change_that_removes_earlier_approvals(self) -> None:
@@ -719,7 +804,7 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
 
     def test_target_refuses_a_symlink_in_place_of_a_gate_directory(self) -> None:
         # Gate code moved behind a symlink would leave the gate for good.
-        for path in (".github/actions", "ci/checks", "ci"):
+        for path in (".github/workflows", "ci/release", "ci", ".github"):
             with self.subTest(path=path):
                 self.git("checkout", "--quiet", "-B", f"symlink-{len(path)}", self.base)
                 target = self.repo / path
@@ -933,38 +1018,68 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         self.git("reset", "--quiet", "--hard", "HEAD")
         self.assert_target_refused("bring the pull request up to date with its base branch")
 
-    def test_target_refuses_control_characters_in_gate_paths(self) -> None:
-        # A line break in a path could make two different file sets share a manifest.
-        self.edit("ci/checks/x.py\n0000  ci/release/y.py", "data\n")
-        self.commit("a gate path with a line break")
-        self.approve_gate_change(["operator-01", "operator-02"], manifest=b"base  0\n")
-        self.assert_target_refused("a gate path may hold only printable characters")
-
-    def test_target_treats_case_variants_of_gate_paths_as_gate_code(self) -> None:
-        for path in ("CI/release/validate_release_artifacts.py", "ci/relea\u017fe/validate_release_artifacts.py", ".GitHub/Workflows/x.yml"):
+    def test_target_refuses_the_code_owned_directories_in_other_letters(self) -> None:
+        # GitHub gives such a path no code owner and reads no workflow from
+        # it; a case-insensitive checkout puts it in the directory all the
+        # same, over the file of that name. No approval allows it, for the
+        # gate's own files either.
+        for index, (path, directory) in enumerate((
+            ("CI/release/validate_key_metadata.py", "ci/release/"),
+            ("ci/relea\u017fe/key_policy_gate.py", "ci/release/"),
+            ("ci/Release/validate_release_artifacts.py", "ci/release/"),
+            ("CI/checks/classify_merge_profile.py", "ci/checks/"),
+            ("ci/\uff43hecks/data.json", "ci/checks/"),
+            (".github/Actions/setup/action.yml", ".github/actions/"),
+            (".GitHub/workflows/x.yml", ".github/workflows/"),
+            (".github/Workflows/key-policy-gate.yml", ".github/workflows/"),
+            (".github/workflow\u017f/x.yml", ".github/workflows/"),
+        )):
             with self.subTest(path=path):
-                self.git("checkout", "--quiet", "-B", f"case-variant-{len(path)}-{ord(path[1])}", self.base)
-                self.edit(path, "data\n")
-                self.commit("a gate path in other letters")
-                self.assert_target_refused("Gate code changed:")
+                self.git("checkout", "--quiet", "-B", f"other-letters-{index}", self.base)
+                self.edit(path, "permissions: {}\njobs: {}\n")
+                self.commit("a code-owned directory in other letters")
+                self.assert_target_refused(f"{path} names {directory} with other letters")
+        # With approvals too: the gate's own file in a directory spelt otherwise.
+        self.git("checkout", "--quiet", "-B", "other-letters-approved", self.base)
+        self.edit("CI/release/validate_key_metadata.py", "data\n")
+        self.commit("a gate file in a directory in other letters")
+        self.approve_gate_change(["operator-01", "operator-02"])
+        result = self.run_target()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Gate code changed: CI/release/validate_key_metadata.py", result.stdout)
+        self.assertIn("CI/release/validate_key_metadata.py names ci/release/ with other letters", result.stdout)
+
+    def test_target_treats_a_gate_file_in_other_letters_as_gate_code(self) -> None:
+        # In the name of the file itself, which no directory rule covers.
+        self.edit("ci/release/Validate_Key_Metadata.py", "data\n")
+        self.commit("a gate file in other letters")
+        self.assert_target_refused("Gate code changed: ci/release/Validate_Key_Metadata.py")
+
+    def test_target_lets_a_misspelt_path_be_removed(self) -> None:
+        for index, path in enumerate((".github/Workflows/old.yml", "ci/Checks/old.py")):
+            with self.subTest(path=path):
+                self.git("checkout", "--quiet", "-B", f"remove-misspelt-{index}", self.base)
+                self.edit(path, "permissions: {}\njobs: {}\n")
+                self.commit("landed without the gate")
+                landed = self.git("rev-parse", "HEAD")
+                (self.repo / path).unlink()
+                self.commit("remove it")
+                self.base, base = landed, self.base
+                try:
+                    self.assert_target_accepted("No key policy or gate code path changed")
+                finally:
+                    self.base = base
 
     def test_target_refuses_another_check_under_the_gates_name(self) -> None:
         workflow = self.repo / ".github" / "workflows" / "other.yml"
         workflow.parent.mkdir(parents=True, exist_ok=True)
         workflow.write_text("jobs:\n  other:\n    name: Key Policy Gate\n    runs-on: ubuntu-24.04\n", encoding="utf8")
         self.commit("another workflow")
-        self.approve_gate_change(["operator-01", "operator-02"])
         self.assert_target_refused("names something 'Key Policy Gate'")
-
-    def test_target_treats_composite_actions_as_gate_code(self) -> None:
-        self.edit(".github/actions/setup/action.yml", "runs:\n  using: composite\n  steps: []\n")
-        self.commit("add a composite action")
-        self.assert_target_refused("Gate code changed: .github/actions/setup/action.yml")
 
     def test_target_refuses_the_gates_name_with_a_trailing_comment(self) -> None:
         self.edit(".github/workflows/other.yml", "jobs:\n  other:\n    name: Key Policy Gate  # required\n")
         self.commit("another workflow")
-        self.approve_gate_change(["operator-01", "operator-02"])
         self.assert_target_refused("names something 'Key Policy Gate'")
 
     def test_target_needs_an_up_to_date_branch_for_a_gate_change(self) -> None:
@@ -987,6 +1102,26 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
     def test_target_refuses_gate_approvals_without_a_gate_change(self) -> None:
         self.approve_gate_change(["operator-01", "operator-02"])
         self.assert_target_refused("gate approvals arrive only with the change to the gate's code they approve")
+
+    def test_target_sees_a_submodule_entry_the_bases_gitmodules_would_hide(self) -> None:
+        # git diff leaves out a submodule whose .gitmodules entry says ignore = all;
+        # the gate runs in a checkout of the base, which holds that file.
+        for index, path in enumerate((f"{KEYS}/evil", "contrib/keys/gate-approvals/" + "0" * 64 + "/x", "contrib/keys/other")):
+            with self.subTest(path=path):
+                base = self.base
+                try:
+                    self.git("checkout", "--quiet", "-B", f"submodule-{index}", self.base)
+                    self.edit(".gitmodules", f'[submodule "hidden"]\n\tpath = {path}\n\turl = ./hidden\n\tignore = all\n')
+                    self.commit("a submodule entry, landed before the submodule")
+                    self.land()
+                    self.git("update-index", "--add", "--cacheinfo", f"160000,{self.base},{path}")
+                    self.git("commit", "--quiet", "-m", "a submodule in a gated place")
+                    self.assertEqual(self.git("diff", "--name-only", self.base, "HEAD"), "")
+                    result = self.run_target()
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertNotIn("No key policy or gate code path changed", result.stdout)
+                finally:
+                    self.base = base
 
     def test_target_refuses_other_files_under_contrib_keys(self) -> None:
         self.edit("contrib/keys/notes.md", "Notes.\n")
