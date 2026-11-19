@@ -91,6 +91,15 @@ struct SyntheticWalletState {
     //! The address book, returned by getAddresses() and searched by
     //! getAddress(). Both wait on the encryption latch.
     std::vector<interfaces::WalletAddress> address_book;
+    //! Number of getAddress() calls, counted before the call waits.
+    int get_address_calls{0};
+    //! Listener for the address book notification, so a test can raise it
+    //! the way the wallet does after changing address_book.
+    interfaces::Wallet::AddressBookChangedFn address_book_changed;
+    //! Stand-in for another thread holding the wallet lock, as the wallet
+    //! does while it connects a block: calls that wait on the encryption
+    //! latch also wait while this is set, and tryGetTxStatus() gives up.
+    bool wallet_lock_held{false};
     bool psbt_sign_entered{false};
     bool allow_psbt_reservation{true};
     bool allow_psbt_completion{true};

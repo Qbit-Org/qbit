@@ -75,6 +75,14 @@ public:
     /** Look up label for address in address book, if not found return empty string. */
     QString labelForAddress(const QString &address) const;
 
+    /** Look up label for address in this model's rows, and in the entries a
+        pk_hash_only model leaves out of them, without reading the wallet. If
+        not found return empty string. The rows follow the wallet's address
+        book notifications, so the answer lags the wallet until those are
+        delivered: use it to show a label, as the transaction list does on
+        every repaint and filter pass, not to decide what to write. */
+    QString cachedLabelForAddress(const QString &address) const;
+
     /** Look up purpose for address in address book, if not found return empty string. */
     std::optional<wallet::AddressPurpose> purposeForAddress(const QString &address) const;
 

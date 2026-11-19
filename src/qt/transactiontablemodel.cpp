@@ -17,11 +17,15 @@
 
 #include <core_io.h>
 #include <interfaces/handler.h>
+#include <key_io.h>
 #include <tinyformat.h>
 #include <uint256.h>
+#include <util/strencodings.h>
+#include <util/string.h>
 
 #include <algorithm>
 #include <functional>
+#include <string_view>
 
 #include <QColor>
 #include <QDateTime>
@@ -385,7 +389,7 @@ QString TransactionTableModel::formatTxDate(const TransactionRecord *wtx) const
  */
 QString TransactionTableModel::lookupAddress(const std::string &address, bool tooltip) const
 {
-    QString label = walletModel->getAddressTableModel()->labelForAddress(QString::fromStdString(address));
+    QString label = walletModel->getAddressTableModel()->cachedLabelForAddress(QString::fromStdString(address));
     QString description;
     if(!label.isEmpty())
     {
@@ -396,6 +400,45 @@ QString TransactionTableModel::lookupAddress(const std::string &address, bool to
         description += QString(" (") + QString::fromStdString(address) + QString(")");
     }
     return description;
+}
+
+/* Whether a row whose address is row_address shows the label that the
+   address book holds for the encoded address. Labels are looked up by the
+   row address decoded and encoded again, which gives the row address back
+   when it was encoded from an output. An address the wallet stored as text
+   (RecvFromOther, SendToOther and their coinbase form) can differ from the
+   encoded address only in case and surrounding white space, which decoding
+   ignores, so only such a spelling needs decoding to compare. */
+static bool ShowsLabelOf(const std::string& row_address, const std::string& address)
+{
+    if (row_address == address) return true;
+    const std::string_view trimmed{util::TrimStringView(row_address)};
+    if (trimmed.size() != address.size() ||
+        !std::equal(trimmed.begin(), trimmed.end(), address.begin(), [](char a, char b) { return ToLower(a) == ToLower(b); })) {
+        return false;
+    }
+    return EncodeDestination(DecodeDestination(row_address)) == address;
+}
+
+void TransactionTableModel::updateAddressLabel(const QString &address)
+{
+    // Rows read their labels from the address table model, not from the
+    // wallet, so nothing reads a changed label again unless told to. Notify
+    // the rows that show this address, and only those (a whole-table change
+    // re-runs every proxy's filter over the full history), so that views,
+    // filters and sorts follow the address book.
+    const std::string encoded{address.toStdString()};
+    int first{-1};
+    for (int row = 0; row <= priv->size(); ++row) {
+        if (row < priv->size() && ShowsLabelOf(priv->cachedWallet.at(row).address, encoded)) {
+            if (first < 0) first = row;
+            continue;
+        }
+        if (first >= 0) {
+            Q_EMIT dataChanged(index(first, 0), index(row - 1, columns.length() - 1));
+            first = -1;
+        }
+    }
 }
 
 QString TransactionTableModel::formatTxType(const TransactionRecord *wtx) const
@@ -461,7 +504,7 @@ QVariant TransactionTableModel::addressColor(const TransactionRecord *wtx) const
     case TransactionRecord::SendToAddress:
     case TransactionRecord::Generated:
         {
-        QString label = walletModel->getAddressTableModel()->labelForAddress(QString::fromStdString(wtx->address));
+        QString label = walletModel->getAddressTableModel()->cachedLabelForAddress(QString::fromStdString(wtx->address));
         if(label.isEmpty())
             return COLOR_BAREADDRESS;
         } break;
@@ -613,7 +656,7 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
     case AddressRole:
         return QString::fromStdString(rec->address);
     case LabelRole:
-        return walletModel->getAddressTableModel()->labelForAddress(QString::fromStdString(rec->address));
+        return walletModel->getAddressTableModel()->cachedLabelForAddress(QString::fromStdString(rec->address));
     case AmountRole:
         return qint64(rec->credit + rec->debit);
     case TxHashRole:
@@ -624,7 +667,7 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
         {
             QString details;
             QDateTime date = QDateTime::fromSecsSinceEpoch(rec->time);
-            QString txLabel = walletModel->getAddressTableModel()->labelForAddress(QString::fromStdString(rec->address));
+            QString txLabel = walletModel->getAddressTableModel()->cachedLabelForAddress(QString::fromStdString(rec->address));
 
             details.append(date.toString("M/d/yy HH:mm"));
             details.append(" ");

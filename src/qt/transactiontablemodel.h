@@ -83,6 +83,11 @@ public:
         being encrypted. Called by the wallet model once the encryption has
         released the wallet, whoever started it. */
     void deliverDeferredUpdates();
+    /** The address book entry for an encoded address was added, changed or
+        removed. Rows show labels from the address table model, so notify
+        views of the rows that show this address, and only those. Called by
+        the wallet model once the address table model has the update. */
+    void updateAddressLabel(const QString &address);
 
 private:
     WalletModel *walletModel;

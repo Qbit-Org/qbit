@@ -201,8 +201,15 @@ void WalletModel::updateTransaction()
 void WalletModel::updateAddressBook(const QString &address, const QString &label,
         bool isMine, wallet::AddressPurpose purpose, int status)
 {
+    // The transaction list shows labels from the address table model, so
+    // update that first and then have the rows that show this address read
+    // their label again. Listeners may run nested event loops that delete
+    // this model, so check it in between.
+    QPointer<WalletModel> model{this};
     if(addressTableModel)
         addressTableModel->updateEntry(address, label, isMine, purpose, status);
+    if (!model) return;
+    if (transactionTableModel) transactionTableModel->updateAddressLabel(address);
 }
 
 void WalletModel::updateCanGetAddresses()

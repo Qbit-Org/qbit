@@ -196,6 +196,7 @@ public:
     bool getAddress(const CTxDestination& dest, std::string* name, wallet::AddressPurpose* purpose) override
     {
         std::unique_lock lock{m_state->mutex};
+        ++m_state->get_address_calls;
         WaitForEncryption(lock);
         for (const auto& entry : m_state->address_book) {
             if (entry.dest != dest) continue;
@@ -549,7 +550,7 @@ public:
     bool tryGetTxStatus(const Txid& txid, interfaces::WalletTxStatus& tx_status, int& num_blocks, int64_t& block_time) override
     {
         std::lock_guard lock{m_state->mutex};
-        if (m_state->encrypt_in_progress || !m_state->wallet_tx || m_state->wallet_tx->tx->GetHash() != txid) return false;
+        if (m_state->encrypt_in_progress || m_state->wallet_lock_held || !m_state->wallet_tx || m_state->wallet_tx->tx->GetHash() != txid) return false;
         tx_status = m_state->wallet_tx_status;
         num_blocks = tx_status.block_height;
         block_time = 0;
@@ -786,7 +787,20 @@ public:
             }
         });
     }
-    std::unique_ptr<interfaces::Handler> handleAddressBookChanged(AddressBookChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
+    std::unique_ptr<interfaces::Handler> handleAddressBookChanged(AddressBookChangedFn fn) override
+    {
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_state->address_book_changed = std::move(fn);
+        }
+        std::weak_ptr<SyntheticWalletState> weak_state{m_state};
+        return interfaces::MakeCleanupHandler([weak_state] {
+            if (auto state = weak_state.lock()) {
+                std::lock_guard lock{state->mutex};
+                state->address_book_changed = {};
+            }
+        });
+    }
     std::unique_ptr<interfaces::Handler> handleTransactionChanged(TransactionChangedFn fn) override
     {
         uint64_t id;
@@ -835,10 +849,11 @@ public:
 
 private:
     //! Stand in for the wallet locks that CWallet::EncryptWallet holds for
-    //! the whole operation.
+    //! the whole operation, or that another thread holds while
+    //! wallet_lock_held is set.
     void WaitForEncryption(std::unique_lock<std::mutex>& lock) const
     {
-        m_state->condition.wait(lock, [this] { return !m_state->encrypt_in_progress; });
+        m_state->condition.wait(lock, [this] { return !m_state->encrypt_in_progress && !m_state->wallet_lock_held; });
     }
 
     wallet::PQCUsageReport m_report;
