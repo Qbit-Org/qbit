@@ -4707,6 +4707,98 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
     VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
 }
 
+//! The wallet model registers for address book changes before its address
+//! table model reads the address book. Changes another thread makes while
+//! the models load, which takes seconds for a long history, reach the
+//! transaction list once the constructor has returned, wherever they fall
+//! around that read, and leave each address listed once.
+void TestAddressBookChangesWhileModelLoads(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const auto p2mr{[](uint8_t n) { return CTxDestination{WitnessV2P2MR{uint256{n}}}; }};
+    // Filed before the model registers: in the read only.
+    const CTxDestination before{p2mr(0x51)};
+    // Filed after it registers and before the read: in the read and notified.
+    const CTxDestination during{p2mr(0x52)};
+    // Filed after the read, before the constructor returns.
+    const CTxDestination after{p2mr(0x53)};
+    // Filed and relabelled, or filed and removed, before the read.
+    const CTxDestination relabelled{p2mr(0x54)};
+    const CTxDestination removed{p2mr(0x55)};
+    // Filed before the read, and relabelled or removed after it.
+    const CTxDestination relabelled_later{p2mr(0x56)};
+    const CTxDestination removed_later{p2mr(0x57)};
+    state->address_book.emplace_back(before, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "before");
+    state->wallet_tx = MakeSyntheticPayment({before, during, after, relabelled, removed, relabelled_later, removed_later}, 5);
+
+    const auto change{[&state](const CTxDestination& dest, const std::string& label, ChangeType status) {
+        return SyntheticAddressBookChange(state, dest, label, wallet::AddressPurpose::RECEIVE, status);
+    }};
+    // Make the changes on another thread, as an RPC does while the GUI thread
+    // is inside the constructor. The notifications are only posted: the
+    // constructor does not run the event loop.
+    const auto change_elsewhere{[](std::vector<std::function<void()>> changes) {
+        std::thread thread{[changes] {
+            for (const auto& change : changes) change();
+        }};
+        thread.join();
+    }};
+    {
+        std::lock_guard lock{state->mutex};
+        state->get_addresses_entered = [&] {
+            change_elsewhere({
+                change(during, "during", CT_NEW),
+                change(relabelled, "first", CT_NEW),
+                change(relabelled, "second", CT_UPDATED),
+                change(removed, "gone", CT_NEW),
+                change(removed, "", CT_DELETED),
+                change(relabelled_later, "old", CT_NEW),
+                change(removed_later, "doomed", CT_NEW),
+            });
+        };
+        state->get_addresses_returning = [&] {
+            change_elsewhere({
+                change(after, "after", CT_NEW),
+                change(relabelled_later, "new", CT_UPDATED),
+                change(removed_later, "", CT_DELETED),
+            });
+        };
+    }
+    auto model{env.makeModel(state)};
+    {
+        std::lock_guard lock{state->mutex};
+        state->get_addresses_entered = {};
+        state->get_addresses_returning = {};
+    }
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    QCOMPARE(table->rowCount({}), 7);
+
+    // The constructor has returned with what the read found, and nothing
+    // raised meanwhile has been applied yet.
+    QCOMPARE(addresses->rowCount({}), 5);
+    QCOMPARE(TransactionLabel(*table, 2), QString{});
+    QCOMPARE(TransactionLabel(*table, 5), QStringLiteral("old"));
+
+    QCoreApplication::sendPostedEvents();
+    std::vector<interfaces::WalletAddress> book;
+    {
+        std::lock_guard lock{state->mutex};
+        book = state->address_book;
+    }
+    QCOMPARE(book.size(), size_t{5});
+    QCOMPARE(addresses->rowCount({}), 5);
+    for (const auto& entry : book) {
+        const QString address{QString::fromStdString(EncodeDestination(entry.dest))};
+        QVERIFY2(addresses->lookupAddress(address) >= 0, qPrintable(address));
+        QCOMPARE(addresses->cachedLabelForAddress(address), QString::fromStdString(entry.name));
+    }
+    const std::array<QString, 7> labels{QStringLiteral("before"), QStringLiteral("during"), QStringLiteral("after"),
+                                        QStringLiteral("second"), QString{}, QStringLiteral("new"), QString{}};
+    for (int row = 0; row < 7; ++row) QCOMPARE(TransactionLabel(*table, row), labels[row]);
+}
+
 //! BitcoinGUI::updateWalletStatus reads the current wallet whenever any wallet
 //! reports a status change, so another wallet's notification while the
 //! current one is being encrypted must not send the GUI thread into the
@@ -6103,6 +6195,7 @@ void WalletTests::walletTests()
     TestTransactionLabelDeliveryOrder(m_node);
     TestLabelChangeUpdatesItsRows(m_node);
     TestTransactionLabelsMatchWallet(m_node);
+    TestAddressBookChangesWhileModelLoads(m_node);
     TestEncryptWalletOtherWalletStatusChange(m_node);
     TestEncryptWalletFailureReportsError(m_node);
     TestEncryptWalletAlreadyEncryptedByAnotherRequest(m_node);

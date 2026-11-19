@@ -73,6 +73,10 @@ struct WalletModel::BumpFeeProgress {
     unsigned int total{0};
 };
 
+static void NotifyAddressBookChanged(WalletModel *walletmodel,
+        const CTxDestination &address, const std::string &label, bool isMine,
+        wallet::AddressPurpose purpose, ChangeType status);
+
 WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle *platformStyle, QObject *parent) :
     QObject(parent),
     m_wallet(std::move(wallet)),
@@ -89,6 +93,13 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     m_last_encryption_status = readEncryptionStatus();
     m_last_pqc_key_validation_info = m_wallet->getPQCKeyValidationInfo();
 
+    // Register for address book changes before the address table model
+    // reads the address book, which the transaction list shows labels from.
+    // A change another thread makes while the models load is then queued and
+    // applied once this constructor has returned, instead of being lost; one
+    // the read already includes is skipped, or applied again with the state
+    // it already has. The other handlers follow in subscribeToCoreSignals().
+    m_handler_address_book_changed = m_wallet->handleAddressBookChanged(std::bind(NotifyAddressBookChanged, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
     addressTableModel = new AddressTableModel(this);
     transactionTableModel = new TransactionTableModel(platformStyle, this);
     recentRequestsTableModel = new RecentRequestsTableModel(this);
@@ -756,7 +767,7 @@ void WalletModel::subscribeToCoreSignals()
     // Connect signals to wallet
     m_handler_unload = m_wallet->handleUnload(std::bind(&NotifyUnload, this));
     m_handler_status_changed = m_wallet->handleStatusChanged(std::bind(&NotifyKeyStoreStatusChanged, this));
-    m_handler_address_book_changed = m_wallet->handleAddressBookChanged(std::bind(NotifyAddressBookChanged, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
+    // The constructor has registered m_handler_address_book_changed.
     m_handler_transaction_changed = m_wallet->handleTransactionChanged(std::bind(NotifyTransactionChanged, this, std::placeholders::_1, std::placeholders::_2));
     m_handler_show_progress = m_wallet->handleShowProgress(std::bind(ShowProgress, this, std::placeholders::_1, std::placeholders::_2));
     m_handler_can_get_addrs_changed = m_wallet->handleCanGetAddressesChanged(std::bind(NotifyCanGetAddressesChanged, this));

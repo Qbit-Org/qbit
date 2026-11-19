@@ -209,9 +209,22 @@ public:
     }
     std::vector<interfaces::WalletAddress> getAddresses() override
     {
-        std::unique_lock lock{m_state->mutex};
-        WaitForEncryption(lock);
-        return m_state->address_book;
+        std::function<void()> entered;
+        std::function<void()> returning;
+        {
+            std::lock_guard lock{m_state->mutex};
+            entered = m_state->get_addresses_entered;
+            returning = m_state->get_addresses_returning;
+        }
+        if (entered) entered();
+        std::vector<interfaces::WalletAddress> addresses;
+        {
+            std::unique_lock lock{m_state->mutex};
+            WaitForEncryption(lock);
+            addresses = m_state->address_book;
+        }
+        if (returning) returning();
+        return addresses;
     }
     std::vector<OutputType> getAvailableAddressTypes() override { return {OutputType::P2MR}; }
     std::vector<std::string> getAddressReceiveRequests() override { return {}; }
