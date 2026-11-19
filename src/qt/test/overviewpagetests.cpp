@@ -870,6 +870,7 @@ void OverviewPageTests::recentTransactionsTests()
     QCOMPARE(recent->sizeHint().height(), NUM_ITEMS * row_height);
     const int full_height{recent->height()};
     std::vector<QRect> full_rects;
+    full_rects.reserve(NUM_ITEMS);
     for (int row = 0; row < NUM_ITEMS; ++row) full_rects.push_back(recent->visualRect(recent->model()->index(row, TransactionTableModel::ToAddress)));
 
     // Older transactions than the ones shown do not change the list or where
