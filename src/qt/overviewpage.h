@@ -11,6 +11,7 @@
 #include <memory>
 
 class ClientModel;
+class HeadProxyModel;
 class TransactionFilterProxy;
 class TxViewDelegate;
 class PlatformStyle;
@@ -73,11 +74,12 @@ private:
     TxViewDelegate *txdelegate;
     OverviewLogoOverlay* m_background_logo{nullptr};
     std::unique_ptr<TransactionFilterProxy> filter;
+    //! The first rows of filter, shown in the recent transactions list.
+    std::unique_ptr<HeadProxyModel> m_recent_transactions;
 
     void updateLogoOverlayGeometry();
 
 private Q_SLOTS:
-    void LimitTransactionRows();
     void updateDisplayUnit();
     void handleTransactionClicked(const QModelIndex &index);
     void updateAlerts(const QString &warnings);

@@ -9,6 +9,7 @@
 #include <qt/clientmodel.h>
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
+#include <qt/headproxymodel.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
 #include <qt/transactionfilterproxy.h>
@@ -204,8 +205,8 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
 
 void OverviewPage::handleTransactionClicked(const QModelIndex &index)
 {
-    if(filter)
-        Q_EMIT transactionClicked(filter->mapToSource(index));
+    if (filter && m_recent_transactions)
+        Q_EMIT transactionClicked(filter->mapToSource(m_recent_transactions->mapToSource(index)));
 }
 
 void OverviewPage::setPrivacy(bool privacy)
@@ -271,13 +272,22 @@ void OverviewPage::setWalletModel(WalletModel *model)
         filter->setShowInactive(false);
         filter->sort(TransactionTableModel::Date, Qt::DescendingOrder);
 
-        ui->listTransactions->setModel(filter.get());
-        ui->listTransactions->setModelColumn(TransactionTableModel::ToAddress);
+        // Only show the most recent NUM_ITEMS rows. The view's model has no
+        // more rows than that, so the view keeps no state for the rest of the
+        // history.
+        m_recent_transactions = std::make_unique<HeadProxyModel>(NUM_ITEMS);
+        m_recent_transactions->setSourceModel(filter.get());
 
-        connect(filter.get(), &TransactionFilterProxy::rowsInserted, this, &OverviewPage::LimitTransactionRows);
-        connect(filter.get(), &TransactionFilterProxy::rowsRemoved, this, &OverviewPage::LimitTransactionRows);
-        connect(filter.get(), &TransactionFilterProxy::rowsMoved, this, &OverviewPage::LimitTransactionRows);
-        LimitTransactionRows();
+        ui->listTransactions->setModel(m_recent_transactions.get());
+        ui->listTransactions->setModelColumn(TransactionTableModel::ToAddress);
+        // The list's height follows the length of the whole history, see
+        // TransactionOverviewWidget::sizeHint().
+        const auto update_list_height{[list = ui->listTransactions] { list->updateGeometry(); }};
+        connect(filter.get(), &QAbstractItemModel::rowsInserted, ui->listTransactions, update_list_height);
+        connect(filter.get(), &QAbstractItemModel::rowsRemoved, ui->listTransactions, update_list_height);
+        connect(filter.get(), &QAbstractItemModel::layoutChanged, ui->listTransactions, update_list_height);
+        connect(filter.get(), &QAbstractItemModel::modelReset, ui->listTransactions, update_list_height);
+
         // Keep up to date with wallet
         setBalance(model->getCachedBalance());
         connect(model, &WalletModel::balanceChanged, this, &OverviewPage::setBalance);
@@ -317,16 +327,6 @@ void OverviewPage::updateLogoOverlayGeometry()
         logo_size,
         logo_size);
     m_background_logo->lower();
-}
-
-// Only show most recent NUM_ITEMS rows
-void OverviewPage::LimitTransactionRows()
-{
-    if (filter && ui->listTransactions && ui->listTransactions->model() && filter.get() == ui->listTransactions->model()) {
-        for (int i = 0; i < filter->rowCount(); ++i) {
-            ui->listTransactions->setRowHidden(i, i >= NUM_ITEMS);
-        }
-    }
 }
 
 void OverviewPage::updateDisplayUnit()

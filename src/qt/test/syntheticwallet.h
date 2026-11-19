@@ -88,6 +88,14 @@ struct SyntheticWalletState {
     //! TRY_LOCK it stands in for.
     std::optional<interfaces::WalletTx> wallet_tx;
     interfaces::WalletTxStatus wallet_tx_status{};
+    //! Further transactions the wallet holds next to wallet_tx, by txid, each
+    //! with the status tryGetTxStatus() reports for it. They are read the
+    //! same way as wallet_tx, so a test can build a long history.
+    struct HistoryTx {
+        interfaces::WalletTx tx;
+        interfaces::WalletTxStatus status{};
+    };
+    std::map<Txid, HistoryTx> history;
     //! The address book, returned by getAddresses() and searched by
     //! getAddress(). Both wait on the encryption latch.
     std::vector<interfaces::WalletAddress> address_book;

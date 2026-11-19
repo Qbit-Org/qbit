@@ -179,6 +179,8 @@ if(ENABLE_WALLET)
       createwalletdialog.h
       editaddressdialog.cpp
       editaddressdialog.h
+      headproxymodel.cpp
+      headproxymodel.h
       openuridialog.cpp
       openuridialog.h
       overviewpage.cpp
