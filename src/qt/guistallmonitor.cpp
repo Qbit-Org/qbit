@@ -39,11 +39,7 @@ GuiStallMonitor::~GuiStallMonitor()
     // A stall still in progress ends here instead of at a heartbeat. Shutdown
     // deletes the monitor before the event loop resumes, so without this a
     // stall in shutdown would leave only the line below.
-    const auto gap{m_clock() - m_last_heartbeat};
-    if (gap - m_interval > m_threshold) {
-        LogDebug(BCLog::QT, "GUI event loop not serviced for %d ms when the stall monitor stopped (gap since the last heartbeat, due every %d ms)",
-                 Ticks<std::chrono::milliseconds>(gap), m_interval.count());
-    }
+    logIfStall(m_clock() - m_last_heartbeat, /*at_stop=*/true);
     LogDebug(BCLog::QT, "GUI stall monitor stopped after %d heartbeats", m_heartbeats);
 }
 
@@ -53,10 +49,18 @@ void GuiStallMonitor::heartbeat()
     const auto gap{now - m_last_heartbeat};
     m_last_heartbeat = now;
     ++m_heartbeats;
-    // This heartbeat was due at most one interval after the previous one, so
-    // it waited at least gap - interval for the loop. See the class comment.
-    if (gap - m_interval > m_threshold) {
-        LogDebug(BCLog::QT, "GUI event loop not serviced for %d ms (gap between heartbeats due every %d ms)",
-                 Ticks<std::chrono::milliseconds>(gap), m_interval.count());
-    }
+    logIfStall(gap, /*at_stop=*/false);
+}
+
+void GuiStallMonitor::logIfStall(std::chrono::steady_clock::duration gap, bool at_stop) const
+{
+    // The heartbeat after the one that began the gap was due at most one
+    // interval later, so the loop has kept it waiting for at least
+    // gap - interval. See the class comment.
+    if (gap - m_interval <= m_threshold) return;
+    LogDebug(BCLog::QT, "GUI event loop not serviced for %d ms%s (gap %s due every %d ms)",
+             Ticks<std::chrono::milliseconds>(gap),
+             at_stop ? " when the stall monitor stopped" : "",
+             at_stop ? "since the last heartbeat," : "between heartbeats",
+             m_interval.count());
 }

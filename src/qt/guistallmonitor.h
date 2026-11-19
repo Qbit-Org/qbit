@@ -22,11 +22,17 @@
  * heartbeats bounds how long the loop went without servicing timers:
  * - The gap is an upper bound, because the loop ran at both of its ends.
  * - The gap less one interval is a lower bound if the second heartbeat was
- *   due no later than one interval after the first. That holds for Qt's
- *   precise timers on Linux. Where the system timer is coarser than the
- *   interval, as on Windows with its timer tick of about 15.6 ms, a heartbeat
- *   can fall due later, and the bound and the guarantee below are looser by
- *   that delay.
+ *   due no later than one interval after the first, and ran on the loop's
+ *   next pass after that. Both hold on Linux with either event dispatcher Qt
+ *   uses there: the UNIX one in release builds (depends builds Qt with
+ *   -no-glib) and the GLib one in distribution builds of Qt. They share the
+ *   timer list, which makes a repeating precise timer due again no later than
+ *   one interval after it last ran, and both run due timers on every pass.
+ *   (Qt 4's GLib dispatcher ran timers at idle priority, so a loop busy with
+ *   other events could delay them while the window still responded. Qt 6's
+ *   does not.) Where the system timer is coarser than the interval, as on
+ *   Windows with its timer tick of about 15.6 ms, a heartbeat can fall due
+ *   later, and the bound and the guarantee below are looser by that delay.
  * A stall is logged when the gap less one interval exceeds the threshold.
  * With the timer due on time, nothing shorter than the threshold is logged,
  * and a stall longer than the threshold plus one interval always is.
@@ -56,6 +62,10 @@
  * A loop that keeps processing other work without getting round to due timers
  * also shows a gap. That is logged as well: the timers, and any work they
  * drive, were not serviced.
+ *
+ * Known limit: a stall is logged only once the loop resumes or the monitor is
+ * deleted. A freeze that ends with the process being killed or force-quit
+ * leaves no line.
  *
  * -debug=qt enables the monitor, and so do plain -debug and -debug=1, which
  * enable every category.
@@ -104,6 +114,10 @@ public:
     uint64_t heartbeats() const { return m_heartbeats; }
 
 private:
+    //! Log gap as a stall if it is one. at_stop says that the monitor's
+    //! deletion ended the gap, not a heartbeat.
+    void logIfStall(std::chrono::steady_clock::duration gap, bool at_stop) const;
+
     const std::chrono::milliseconds m_threshold;
     const std::chrono::milliseconds m_interval;
     const Clock m_clock;
