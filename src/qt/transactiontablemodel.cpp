@@ -20,6 +20,7 @@
 #include <key_io.h>
 #include <tinyformat.h>
 #include <uint256.h>
+#include <util/check.h>
 #include <util/string.h>
 
 #include <algorithm>
@@ -252,10 +253,10 @@ public:
     }
 };
 
-TransactionTableModel::TransactionTableModel(const PlatformStyle *_platformStyle, WalletModel *parent):
+TransactionTableModel::TransactionTableModel(const PlatformStyle *_platformStyle, AddressTableModel *address_table_model, WalletModel *parent):
         QAbstractTableModel(parent),
         walletModel(parent),
-        m_address_table_model(parent->getAddressTableModel()),
+        m_address_table_model(Assert(address_table_model)),
         priv(new TransactionTablePriv(this)),
         platformStyle(_platformStyle)
 {

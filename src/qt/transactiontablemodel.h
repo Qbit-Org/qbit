@@ -34,7 +34,9 @@ class TransactionTableModel : public QAbstractTableModel
     Q_OBJECT
 
 public:
-    explicit TransactionTableModel(const PlatformStyle *platformStyle, WalletModel *parent = nullptr);
+    /** The rows show labels from address_table_model, which must list every
+        address: the wallet model passes the one it keeps complete. */
+    explicit TransactionTableModel(const PlatformStyle *platformStyle, AddressTableModel *address_table_model, WalletModel *parent = nullptr);
     ~TransactionTableModel();
 
     enum ColumnIndex {
@@ -102,10 +104,10 @@ public:
 
 private:
     WalletModel *walletModel;
-    /** The address table model the rows read their labels from: the one the
-        wallet model was created with, which lists every address. The wallet
-        model keeps it current, also after WalletModel::refresh() has handed
-        out one that lists only legacy addresses. */
+    /** The address table model the rows read their labels from, which lists
+        every address. The wallet model keeps it current, also after
+        WalletModel::refresh() has handed out one that lists only legacy
+        addresses. */
     AddressTableModel* const m_address_table_model;
     std::unique_ptr<interfaces::Handler> m_handler_transaction_changed;
     std::unique_ptr<interfaces::Handler> m_handler_show_progress;

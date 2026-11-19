@@ -471,8 +471,8 @@ bool AddressTableModel::getAddressData(const QString &address,
     CTxDestination destination = DecodeDestination(address.toStdString());
     // The wallet blocks while an encryption holds its locks, whoever started
     // it, and the address book cannot change until it returns, so answer from
-    // the rows this model already holds. A repaint of the transaction list
-    // looks up its labels here without any user input.
+    // the rows this model already holds. The dialogs that look up a label
+    // or a purpose here would otherwise wait until the encryption ends.
     if (walletModel->isEncryptingWallet()) {
         const AddressTableEntry* entry = priv->find(destination);
         if (!entry) return false;

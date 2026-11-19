@@ -95,14 +95,16 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
 
     // Register for address book changes before the address table model
     // reads the address book, which the transaction list shows labels from.
-    // A change another thread makes while the models load is then queued and
-    // applied once this constructor has returned, instead of being lost; one
-    // the read already includes is skipped, or applied again with the state
-    // it already has. The other handlers follow in subscribeToCoreSignals().
+    // A change another thread makes while the models load is then queued, as
+    // this model lives on this thread, and applied once this constructor has
+    // returned, instead of being lost; one the read already includes is
+    // skipped, or applied again with the state it already has. A change made
+    // on this thread would be applied at once, but the constructor only
+    // reads the wallet. The other handlers follow in subscribeToCoreSignals().
     m_handler_address_book_changed = m_wallet->handleAddressBookChanged(std::bind(NotifyAddressBookChanged, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
     addressTableModel = new AddressTableModel(this);
     m_complete_address_table_model = addressTableModel;
-    transactionTableModel = new TransactionTableModel(platformStyle, this);
+    transactionTableModel = new TransactionTableModel(platformStyle, m_complete_address_table_model, this);
     recentRequestsTableModel = new RecentRequestsTableModel(this);
 
     subscribeToCoreSignals();
