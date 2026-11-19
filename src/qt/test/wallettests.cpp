@@ -4469,19 +4469,18 @@ void TestLabelChangeUpdatesItsRows(interfaces::Node& node)
     view.grab();
 }
 
-//! Compare the label of each address, and of each transaction row, that the
-//! wallet model shows from the address table model with the one the wallet
-//! gives.
-void VerifyLabelsMatchWallet(WalletModel& wallet_model, const QStringList& addresses)
+//! Compare the label of each address in the address table model the
+//! transaction list reads, and of each transaction row, with the one the
+//! wallet gives.
+void VerifyLabelsMatchWallet(WalletModel& wallet_model, const AddressTableModel& labels, const QStringList& addresses)
 {
     const auto wallet_label{[&wallet_model](const QString& address) {
         std::string name;
         if (!wallet_model.wallet().getAddress(DecodeDestination(address.toStdString()), &name, /*purpose=*/nullptr)) return QString{};
         return QString::fromStdString(name);
     }};
-    AddressTableModel* const table{wallet_model.getAddressTableModel()};
     for (const QString& address : addresses) {
-        const QString cached{table->cachedLabelForAddress(address)};
+        const QString cached{labels.cachedLabelForAddress(address)};
         const QString expected{wallet_label(address)};
         QVERIFY2(cached == expected, qPrintable(QStringLiteral("\"%1\": shown \"%2\", wallet \"%3\"").arg(address, cached, expected)));
     }
@@ -4500,8 +4499,9 @@ void VerifyLabelsMatchWallet(WalletModel& wallet_model, const QStringList& addre
 //! entries, a change address the address book holds data for, an entry
 //! removed, relabelled or added, with the change delivered at once or queued,
 //! and for spellings the wallet decodes or rejects. They stay equal after the
-//! message signing dialog has replaced the model with one that lists only
-//! legacy addresses, and reading them never waits for the wallet lock.
+//! message signing dialog has had the wallet model hand out a model that
+//! lists only legacy addresses, and reading them never waits for the wallet
+//! lock.
 void TestTransactionLabelsMatchWallet(interfaces::Node& node)
 {
     TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0", "-keypool=1"}}};
@@ -4577,6 +4577,8 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
     mini_gui.initModelForWallet(node, wallet, platform_style.get());
     WalletModel& wallet_model{*mini_gui.walletModel};
     TransactionTableModel* const transactions{wallet_model.getTransactionTableModel()};
+    // The model the address book pages show and the transaction list reads.
+    AddressTableModel* const labels{wallet_model.getAddressTableModel()};
     QCOMPARE(transactions->rowCount({}), 11);
 
     const auto encode{[](const CTxDestination& dest) { return QString::fromStdString(EncodeDestination(dest)); }};
@@ -4589,14 +4591,14 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
     addresses << encode(receive_labelled).toUpper() << encode(send_segwit).toUpper()
               << QStringLiteral(" %1\t").arg(encode(legacy)) << encode(legacy).toUpper()
               << encode(send_legacy).chopped(1) + QStringLiteral("x") << QStringLiteral("not an address") << QString{};
-    const auto shown_label{[&wallet_model, &encode](const CTxDestination& dest) {
-        return wallet_model.getAddressTableModel()->cachedLabelForAddress(encode(dest));
+    const auto shown_label{[labels, &encode](const CTxDestination& dest) {
+        return labels->cachedLabelForAddress(encode(dest));
     }};
 
-    VerifyLabelsMatchWallet(wallet_model, addresses);
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
     if (QTest::currentTestFailed()) return;
-    QCOMPARE(wallet_model.getAddressTableModel()->cachedLabelForAddress(encode(receive_labelled).toUpper()), QStringLiteral("alice"));
-    QCOMPARE(wallet_model.getAddressTableModel()->cachedLabelForAddress(QStringLiteral(" %1\t").arg(encode(legacy))), QStringLiteral("miner"));
+    QCOMPARE(labels->cachedLabelForAddress(encode(receive_labelled).toUpper()), QStringLiteral("alice"));
+    QCOMPARE(labels->cachedLabelForAddress(QStringLiteral(" %1\t").arg(encode(legacy))), QStringLiteral("miner"));
     QCOMPARE(shown_label(send_p2mr), QStringLiteral("erin"));
 
     // Changes the GUI makes reach the model at once.
@@ -4605,7 +4607,7 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
     QVERIFY(wallet->SetAddressBook(change_with_data, "frank", wallet::AddressPurpose::RECEIVE));
     QVERIFY(wallet->SetAddressBook(never, "gina", wallet::AddressPurpose::SEND));
     QVERIFY(wallet->SetAddressBook(send_blank, "", /*purpose=*/{}));
-    VerifyLabelsMatchWallet(wallet_model, addresses);
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
     if (QTest::currentTestFailed()) return;
     QCOMPARE(shown_label(change_with_data), QStringLiteral("frank"));
 
@@ -4618,27 +4620,38 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
     rpc.join();
     QCoreApplication::sendPostedEvents();
     QCOMPARE(shown_label(removed), QStringLiteral("dave2"));
-    VerifyLabelsMatchWallet(wallet_model, addresses);
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
     if (QTest::currentTestFailed()) return;
 
-    // The message signing dialog replaces the address table model with one
-    // that lists only legacy addresses. Labels of the others still show.
+    // The message signing dialog has the wallet model hand out an address
+    // table model that lists only legacy addresses. The transaction list
+    // keeps showing the labels of the others.
     wallet_model.refresh(/*pk_hash_only=*/true);
     AddressTableModel* const legacy_only{wallet_model.getAddressTableModel()};
+    QVERIFY(legacy_only != labels);
     QCOMPARE(legacy_only->rowCount({}), 1);
     QCOMPARE(legacy_only->index(0, AddressTableModel::Address, {}).data(Qt::EditRole).toString(), encode(legacy));
-    VerifyLabelsMatchWallet(wallet_model, addresses);
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
     if (QTest::currentTestFailed()) return;
     QCOMPARE(shown_label(receive_labelled), QStringLiteral("alice2"));
     QCOMPARE(shown_label(send_p2mr), QStringLiteral("erin"));
 
-    // Entries it leaves out of its rows follow the address book too.
+    // Both models keep following the address book.
     QVERIFY(wallet->SetAddressBook(receive_labelled, "alice3", /*purpose=*/{}));
     QVERIFY(wallet->DelAddressBook(send_p2mr));
     QVERIFY(wallet->SetAddressBook(legacy, "miner2", /*purpose=*/{}));
     QVERIFY(wallet->SetAddressBook(send_legacy, "bob2", wallet::AddressPurpose::SEND));
+    const auto listed_label{[&encode](const AddressTableModel& table, const CTxDestination& dest) {
+        const int row{table.lookupAddress(encode(dest))};
+        return row < 0 ? QStringLiteral("(not listed)") : table.index(row, AddressTableModel::Label, {}).data(Qt::EditRole).toString();
+    }};
     QCOMPARE(legacy_only->rowCount({}), 2);
-    VerifyLabelsMatchWallet(wallet_model, addresses);
+    QCOMPARE(listed_label(*legacy_only, legacy), QStringLiteral("miner2"));
+    QCOMPARE(listed_label(*legacy_only, send_legacy), QStringLiteral("bob2"));
+    QCOMPARE(listed_label(*labels, receive_labelled), QStringLiteral("alice3"));
+    QCOMPARE(listed_label(*labels, send_p2mr), QStringLiteral("(not listed)"));
+    QCOMPARE(listed_label(*labels, send_legacy), QStringLiteral("bob2"));
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
     if (QTest::currentTestFailed()) return;
     QCOMPARE(shown_label(receive_labelled), QStringLiteral("alice3"));
     QCOMPARE(shown_label(send_p2mr), QString{});
@@ -4691,7 +4704,7 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
     holder.join();
     QVERIFY2(!holder_timed_out, "GUI thread waited for the wallet lock while showing transaction labels");
     QCOMPARE(found, 1);
-    VerifyLabelsMatchWallet(wallet_model, addresses);
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
 }
 
 //! BitcoinGUI::updateWalletStatus reads the current wallet whenever any wallet

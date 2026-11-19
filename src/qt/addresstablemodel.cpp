@@ -81,11 +81,6 @@ class AddressTablePriv
 {
 public:
     QList<AddressTableEntry> cachedAddressTable;
-    /* Address book entries that a pk_hash_only model leaves out of its rows,
-       sorted the same way. They are kept so that the model can still answer
-       label lookups for every address: the transaction list asks whichever
-       model the wallet model currently holds. */
-    QList<AddressTableEntry> filteredOutAddressTable;
     AddressTableModel *parent;
 
     explicit AddressTablePriv(AddressTableModel *_parent):
@@ -94,15 +89,15 @@ public:
     void refreshAddressTable(interfaces::Wallet& wallet, bool pk_hash_only = false)
     {
         cachedAddressTable.clear();
-        filteredOutAddressTable.clear();
         {
             for (const auto& address : wallet.getAddresses())
             {
-                QList<AddressTableEntry>& table{pk_hash_only && !std::holds_alternative<PKHash>(address.dest) ?
-                                                    filteredOutAddressTable : cachedAddressTable};
+                if (pk_hash_only && !std::holds_alternative<PKHash>(address.dest)) {
+                    continue;
+                }
                 AddressTableEntry::Type addressType = translateTransactionType(
                         address.purpose, address.is_mine);
-                table.append(AddressTableEntry(addressType,
+                cachedAddressTable.append(AddressTableEntry(addressType,
                                   QString::fromStdString(address.name),
                                   QString::fromStdString(EncodeDestination(address.dest))));
             }
@@ -111,7 +106,6 @@ public:
         // Even though the map is already sorted this re-sorting step is needed because the originating map
         // is sorted by binary address, not by base58() address.
         std::sort(cachedAddressTable.begin(), cachedAddressTable.end(), AddressTableEntryLessThan());
-        std::sort(filteredOutAddressTable.begin(), filteredOutAddressTable.end(), AddressTableEntryLessThan());
     }
 
     void updateEntry(const QString &address, const QString &label, bool isMine, wallet::AddressPurpose purpose, int status)
@@ -125,10 +119,6 @@ public:
         int upperIndex = (upper - cachedAddressTable.begin());
         bool inModel = (lower != upper);
         AddressTableEntry::Type newEntryType = translateTransactionType(purpose, isMine);
-
-        // An entry left out of the rows is updated where it is, so that label
-        // lookups stay current, and no row changes.
-        if (!inModel && updateFilteredOutEntry(address, label, newEntryType, status)) return;
 
         switch(status)
         {
@@ -165,43 +155,19 @@ public:
         }
     }
 
-    /* Apply an address book update to an entry left out of the rows.
-       Returns false if no such entry has the address. */
-    bool updateFilteredOutEntry(const QString& address, const QString& label, AddressTableEntry::Type type, int status)
-    {
-        const auto [lower, upper] = std::equal_range(
-            filteredOutAddressTable.begin(), filteredOutAddressTable.end(), address, AddressTableEntryLessThan());
-        if (lower == upper) return false;
-        switch (status) {
-        case CT_NEW:
-            qWarning() << "AddressTablePriv::updateEntry: Warning: Got CT_NEW, but entry is already in model";
-            break;
-        case CT_UPDATED:
-            lower->type = type;
-            lower->label = label;
-            break;
-        case CT_DELETED:
-            filteredOutAddressTable.erase(lower, upper);
-            break;
-        }
-        return true;
-    }
-
     int size()
     {
         return cachedAddressTable.size();
     }
 
-    /* Find the entry for an encoded address, in the rows or among the entries
-       left out of them, or nullptr if the address book has none */
+    /* Find the entry for an encoded address, or nullptr if the address book
+       has none */
     const AddressTableEntry* find(const QString& address) const
     {
-        for (const QList<AddressTableEntry>* table : {&cachedAddressTable, &filteredOutAddressTable}) {
-            QList<AddressTableEntry>::const_iterator it = std::lower_bound(
-                table->begin(), table->end(), address, AddressTableEntryLessThan());
-            if (it != table->end() && it->address == address) return &*it;
-        }
-        return nullptr;
+        QList<AddressTableEntry>::const_iterator it = std::lower_bound(
+            cachedAddressTable.begin(), cachedAddressTable.end(), address, AddressTableEntryLessThan());
+        if (it == cachedAddressTable.end() || it->address != address) return nullptr;
+        return &*it;
     }
 
     AddressTableEntry *index(int idx)

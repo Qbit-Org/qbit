@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <functional>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <QColor>
 #include <QDateTime>
@@ -254,6 +256,7 @@ public:
 TransactionTableModel::TransactionTableModel(const PlatformStyle *_platformStyle, WalletModel *parent):
         QAbstractTableModel(parent),
         walletModel(parent),
+        m_address_table_model(parent->getAddressTableModel()),
         priv(new TransactionTablePriv(this)),
         platformStyle(_platformStyle)
 {
@@ -389,7 +392,7 @@ QString TransactionTableModel::formatTxDate(const TransactionRecord *wtx) const
  */
 QString TransactionTableModel::lookupAddress(const std::string &address, bool tooltip) const
 {
-    QString label = walletModel->getAddressTableModel()->cachedLabelForAddress(QString::fromStdString(address));
+    QString label = m_address_table_model->cachedLabelForAddress(QString::fromStdString(address));
     QString description;
     if(!label.isEmpty())
     {
@@ -428,16 +431,22 @@ void TransactionTableModel::updateAddressLabel(const QString &address)
     // re-runs every proxy's filter over the full history), so that views,
     // filters and sorts follow the address book.
     const std::string encoded{address.toStdString()};
-    int first{-1};
-    for (int row = 0; row <= priv->size(); ++row) {
-        if (row < priv->size() && ShowsLabelOf(priv->cachedWallet.at(row).address, encoded)) {
-            if (first < 0) first = row;
-            continue;
+    std::vector<std::pair<int, int>> ranges;
+    for (int row = 0; row < priv->size(); ++row) {
+        if (!ShowsLabelOf(priv->cachedWallet.at(row).address, encoded)) continue;
+        if (!ranges.empty() && ranges.back().second == row - 1) {
+            ranges.back().second = row;
+        } else {
+            ranges.emplace_back(row, row);
         }
-        if (first >= 0) {
-            Q_EMIT dataChanged(index(first, 0), index(row - 1, columns.length() - 1));
-            first = -1;
-        }
+    }
+    // A listener may run a nested event loop that deletes this model, or
+    // that adds or removes rows so the row numbers above no longer hold.
+    QPointer<TransactionTableModel> model{this};
+    const int size{priv->size()};
+    for (const auto& [first, last] : ranges) {
+        Q_EMIT dataChanged(index(first, 0), index(last, columns.length() - 1));
+        if (!model || priv->size() != size) return;
     }
 }
 
@@ -504,7 +513,7 @@ QVariant TransactionTableModel::addressColor(const TransactionRecord *wtx) const
     case TransactionRecord::SendToAddress:
     case TransactionRecord::Generated:
         {
-        QString label = walletModel->getAddressTableModel()->cachedLabelForAddress(QString::fromStdString(wtx->address));
+        QString label = m_address_table_model->cachedLabelForAddress(QString::fromStdString(wtx->address));
         if(label.isEmpty())
             return COLOR_BAREADDRESS;
         } break;
@@ -656,7 +665,7 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
     case AddressRole:
         return QString::fromStdString(rec->address);
     case LabelRole:
-        return walletModel->getAddressTableModel()->cachedLabelForAddress(QString::fromStdString(rec->address));
+        return m_address_table_model->cachedLabelForAddress(QString::fromStdString(rec->address));
     case AmountRole:
         return qint64(rec->credit + rec->debit);
     case TxHashRole:
@@ -667,7 +676,7 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
         {
             QString details;
             QDateTime date = QDateTime::fromSecsSinceEpoch(rec->time);
-            QString txLabel = walletModel->getAddressTableModel()->cachedLabelForAddress(QString::fromStdString(rec->address));
+            QString txLabel = m_address_table_model->cachedLabelForAddress(QString::fromStdString(rec->address));
 
             details.append(date.toString("M/d/yy HH:mm"));
             details.append(" ");

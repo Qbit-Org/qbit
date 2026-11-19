@@ -201,14 +201,17 @@ void WalletModel::updateTransaction()
 void WalletModel::updateAddressBook(const QString &address, const QString &label,
         bool isMine, wallet::AddressPurpose purpose, int status)
 {
-    // The transaction list shows labels from the address table model, so
-    // update that first and then have the rows that show this address read
-    // their label again. Listeners may run nested event loops that delete
-    // this model, so check it in between.
+    // refresh() hands out a new address table model and keeps the earlier
+    // ones. The address book pages and the transaction list keep the one
+    // created with this model, which lists every address, and the
+    // transaction list shows its labels. Update each of them, then have the
+    // rows that show this address read their label again. Listeners may run
+    // nested event loops that delete this model, so check it after each.
     QPointer<WalletModel> model{this};
-    if(addressTableModel)
-        addressTableModel->updateEntry(address, label, isMine, purpose, status);
-    if (!model) return;
+    for (AddressTableModel* const table : findChildren<AddressTableModel*>(Qt::FindDirectChildrenOnly)) {
+        table->updateEntry(address, label, isMine, purpose, status);
+        if (!model) return;
+    }
     if (transactionTableModel) transactionTableModel->updateAddressLabel(address);
 }
 

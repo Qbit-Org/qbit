@@ -18,6 +18,7 @@ namespace interfaces {
 class Handler;
 }
 
+class AddressTableModel;
 class PlatformStyle;
 class TransactionRecord;
 class TransactionTablePriv;
@@ -84,13 +85,18 @@ public:
         released the wallet, whoever started it. */
     void deliverDeferredUpdates();
     /** The address book entry for an encoded address was added, changed or
-        removed. Rows show labels from the address table model, so notify
+        removed. Rows show labels from an address table model, so notify
         views of the rows that show this address, and only those. Called by
-        the wallet model once the address table model has the update. */
+        the wallet model once its address table models have the update. */
     void updateAddressLabel(const QString &address);
 
 private:
     WalletModel *walletModel;
+    /** The address table model the rows read their labels from: the one the
+        wallet model was created with, which lists every address. The wallet
+        model keeps it current, also after WalletModel::refresh() has handed
+        out one that lists only legacy addresses. */
+    AddressTableModel* const m_address_table_model;
     std::unique_ptr<interfaces::Handler> m_handler_transaction_changed;
     std::unique_ptr<interfaces::Handler> m_handler_show_progress;
     QStringList columns;
