@@ -530,6 +530,7 @@ public:
         std::unique_lock lock{m_state->mutex};
         WaitForEncryption(lock);
         if (m_state->wallet_tx && m_state->wallet_tx->tx->GetHash() == txid) return m_state->wallet_tx->tx;
+        if (const auto it{m_state->history.find(txid)}; it != m_state->history.end()) return it->second.tx.tx;
         return {};
     }
     interfaces::WalletTx getWalletTx(const Txid& txid) override
@@ -537,20 +538,29 @@ public:
         std::unique_lock lock{m_state->mutex};
         WaitForEncryption(lock);
         if (m_state->wallet_tx && m_state->wallet_tx->tx->GetHash() == txid) return *m_state->wallet_tx;
+        if (const auto it{m_state->history.find(txid)}; it != m_state->history.end()) return it->second.tx;
         return {};
     }
     std::set<interfaces::WalletTx> getWalletTxs() override
     {
         std::unique_lock lock{m_state->mutex};
         WaitForEncryption(lock);
-        if (m_state->wallet_tx) return {*m_state->wallet_tx};
-        return {};
+        std::set<interfaces::WalletTx> txs;
+        if (m_state->wallet_tx) txs.insert(*m_state->wallet_tx);
+        for (const auto& [txid, entry] : m_state->history) txs.insert(entry.tx);
+        return txs;
     }
     bool tryGetTxStatus(const Txid& txid, interfaces::WalletTxStatus& tx_status, int& num_blocks, int64_t& block_time) override
     {
         std::lock_guard lock{m_state->mutex};
-        if (m_state->encrypt_in_progress || !m_state->wallet_tx || m_state->wallet_tx->tx->GetHash() != txid) return false;
-        tx_status = m_state->wallet_tx_status;
+        if (m_state->encrypt_in_progress) return false;
+        if (m_state->wallet_tx && m_state->wallet_tx->tx->GetHash() == txid) {
+            tx_status = m_state->wallet_tx_status;
+        } else if (const auto it{m_state->history.find(txid)}; it != m_state->history.end()) {
+            tx_status = it->second.status;
+        } else {
+            return false;
+        }
         num_blocks = tx_status.block_height;
         block_time = 0;
         return true;
