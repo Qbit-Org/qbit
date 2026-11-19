@@ -7,7 +7,9 @@
 import configparser
 from enum import Enum
 import argparse
+import ctypes
 from datetime import datetime, timezone
+import errno
 import json
 import logging
 import os
@@ -1068,9 +1070,16 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
 
     def skip_if_no_bpf_permissions(self):
         """Skip the running test if we don't have permissions to do BPF syscalls and load BPF maps."""
-        # check for 'root' permissions
-        if os.geteuid() != 0:
-            raise SkipTest("no permissions to use BPF (please review the tests carefully before running them with higher privileges)")
+        from bcc.libbcc import lib  # type: ignore[import]
+
+        # BPF_MAP_TYPE_PERF_EVENT_ARRAY, as used by BCC's perf buffers.
+        fd = lib.bcc_create_map(4, b"usdt_probe", 4, 4, 1, 0)
+        if fd < 0:
+            err = ctypes.get_errno()
+            if err in (errno.EPERM, errno.EACCES):
+                raise SkipTest(f"BPF map creation denied: {os.strerror(err)}")
+            raise OSError(err, os.strerror(err))
+        os.close(fd)
 
     def skip_if_platform_not_linux(self):
         """Skip the running test if we are not on a Linux platform"""
