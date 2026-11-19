@@ -16,6 +16,13 @@ static constexpr auto MODEL_UPDATE_DELAY{250ms};
 /* A delay between GUI-facing sync tip updates during IBD/reindex */
 static constexpr auto SYNC_UPDATE_DELAY{750ms};
 
+/* While the tip is not fresh, the transaction statuses are refreshed once
+   neither the tip nor the wallet's block has changed for the quiet period, or
+   once a change has waited the maximum lag. A fresh tip the wallet has
+   processed refreshes them on the next model update. */
+static constexpr auto STALE_TIP_STATUS_REFRESH_QUIET{5s};
+static constexpr auto STALE_TIP_STATUS_REFRESH_MAX_LAG{60s};
+
 /* A delay between shutdown pollings */
 static constexpr auto SHUTDOWN_POLLING_DELAY{200ms};
 

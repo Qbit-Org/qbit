@@ -716,12 +716,14 @@ public:
         finish(/*cancel_observed=*/false);
         return fail ? std::make_optional(common::PSBTError::SIGHASH_MISMATCH) : std::nullopt;
     }
-    interfaces::WalletBalances getBalances() override { return {.balance = 50 * COIN}; }
-    bool tryGetBalances(interfaces::WalletBalances& balances, uint256&) override
+    interfaces::WalletBalances getBalances() override { return {.balance = m_state->balance}; }
+    bool tryGetBalances(interfaces::WalletBalances& balances, uint256& block_hash) override
     {
         {
             std::lock_guard lock{m_state->mutex};
             if (m_state->encrypt_in_progress) return false;
+            ++m_state->balance_passes;
+            block_hash = m_state->last_block_hash;
         }
         balances = getBalances();
         return true;

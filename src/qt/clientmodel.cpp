@@ -159,6 +159,27 @@ uint256 ClientModel::getBestBlockHash()
     return m_cached_tip_blocks;
 }
 
+ClientModel::BestBlock ClientModel::getBestBlock()
+{
+    {
+        LOCK(m_cached_tip_mutex);
+        if (m_cached_tip_time) return {m_cached_tip_blocks, m_cached_tip_time};
+    }
+
+    // No block tip notification yet. Reading the node locks `cs_main`, so it
+    // must not run under `m_cached_tip_mutex`. Keep the time only if the tip
+    // did not change while it was read.
+    const uint256 tip{m_node.getBestBlockHash()};
+    const int64_t time{m_node.getLastBlockTime()};
+    const bool tip_unchanged{m_node.getBestBlockHash() == tip};
+
+    LOCK(m_cached_tip_mutex);
+    // A notification may have filled the cache in the meantime.
+    if (m_cached_tip_blocks.IsNull()) m_cached_tip_blocks = tip;
+    if (!m_cached_tip_time && tip_unchanged && m_cached_tip_blocks == tip) m_cached_tip_time = time;
+    return {m_cached_tip_blocks, m_cached_tip_time};
+}
+
 BlockSource ClientModel::getBlockSource() const
 {
     if (m_node.isLoadingBlocks()) return BlockSource::DISK;
@@ -229,7 +250,9 @@ void ClientModel::TipChanged(SynchronizationState sync_state, interfaces::BlockT
         cachedBestHeaderTime = tip.block_time;
     } else if (synctype == SyncType::BLOCK_SYNC) {
         m_cached_num_blocks = tip.block_height;
-        WITH_LOCK(m_cached_tip_mutex, m_cached_tip_blocks = tip.block_hash;);
+        LOCK(m_cached_tip_mutex);
+        m_cached_tip_blocks = tip.block_hash;
+        m_cached_tip_time = tip.block_time;
     }
 
     ProcessSyncUpdate({tip.block_height, tip.block_time, verification_progress, synctype, sync_state});
