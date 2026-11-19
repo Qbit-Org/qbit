@@ -4784,6 +4784,37 @@ void TestStoredAddressTextFollowsLabel(interfaces::Node& node)
     }
 }
 
+//! An address that does not decode, or a row without an address, has no
+//! label, as the wallet finds no entry for it, even if the address table
+//! holds an entry whose encoding is the empty string such an address
+//! encodes to.
+void TestUndecodableAddressHasNoLabel(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0xa1}}}};
+    const CTxDestination other{WitnessV2P2MR{uint256{uint8_t{0xa2}}}};
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->address_book.emplace_back(CNoDestination{}, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "ghost");
+    // Output 1 is the wallet's but not paid to one of its addresses, and the
+    // wallet stored no text for it, so its row has no address.
+    interfaces::WalletTx payment{MakeSyntheticPayment({alice, other}, 10)};
+    payment.txout_address_is_mine[1] = false;
+    state->wallet_tx = payment;
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    QCOMPARE(addresses->rowCount({}), 2);
+    QCOMPARE(addresses->lookupAddress(QString{}), 0);
+    QCOMPARE(table->rowCount({}), 2);
+    QCOMPARE(table->index(1, 0).data(TransactionTableModel::AddressRole).toString(), QString{});
+    QCOMPARE(TransactionLabel(*table, 0), QStringLiteral("alice"));
+    QCOMPARE(TransactionLabel(*table, 1), QString{});
+    for (const QString& address : {QString{}, QStringLiteral("not an address"), QStringLiteral(" ")}) {
+        QCOMPARE(addresses->cachedLabelForAddress(address), QString{});
+    }
+}
+
 //! Compare the label of each address in the address table model the
 //! transaction list reads, and of each transaction row, with the one the
 //! wallet gives.
@@ -6551,6 +6582,7 @@ void WalletTests::walletTests()
     TestLabelChangeSendsOneSignal(m_node);
     TestLabelPassKeepsRowsAfterRowChange(m_node);
     TestStoredAddressTextFollowsLabel(m_node);
+    TestUndecodableAddressHasNoLabel(m_node);
     TestTransactionLabelsMatchWallet(m_node);
     TestAddressBookChangesWhileModelLoads(m_node);
     TestEncryptWalletOtherWalletStatusChange(m_node);

@@ -170,9 +170,13 @@ public:
         return &*it;
     }
 
-    /* Find the entry for a destination, encoded as the rows are */
+    /* Find the entry for a destination, encoded as the rows are. The wallet
+       has no entry for a destination that is not valid, such as an address
+       that does not decode, so neither does this, even if a row's encoding
+       is the empty string that such a destination encodes to. */
     const AddressTableEntry* find(const CTxDestination& dest) const
     {
+        if (!IsValidDestination(dest)) return nullptr;
         return find(QString::fromStdString(EncodeDestination(dest)));
     }
 
