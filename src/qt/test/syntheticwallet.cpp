@@ -564,7 +564,7 @@ public:
     bool tryGetTxStatus(const Txid& txid, interfaces::WalletTxStatus& tx_status, int& num_blocks, int64_t& block_time) override
     {
         std::lock_guard lock{m_state->mutex};
-        if (m_state->encrypt_in_progress || m_state->wallet_lock_held || !m_state->wallet_tx || m_state->wallet_tx->tx->GetHash() != txid) return false;
+        if (m_state->encrypt_in_progress || m_state->WalletLockExcludesCaller() || !m_state->wallet_tx || m_state->wallet_tx->tx->GetHash() != txid) return false;
         tx_status = m_state->wallet_tx_status;
         num_blocks = tx_status.block_height;
         block_time = 0;
@@ -867,7 +867,7 @@ private:
     //! wallet_lock_held is set.
     void WaitForEncryption(std::unique_lock<std::mutex>& lock) const
     {
-        m_state->condition.wait(lock, [this] { return !m_state->encrypt_in_progress && !m_state->wallet_lock_held; });
+        m_state->condition.wait(lock, [this] { return !m_state->encrypt_in_progress && !m_state->WalletLockExcludesCaller(); });
     }
 
     wallet::PQCUsageReport m_report;

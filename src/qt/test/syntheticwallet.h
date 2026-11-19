@@ -105,6 +105,11 @@ struct SyntheticWalletState {
     //! does while it connects a block: calls that wait on the encryption
     //! latch also wait while this is set, and tryGetTxStatus() gives up.
     bool wallet_lock_held{false};
+    //! The thread holding it, if a test sets one. As cs_wallet is a
+    //! recursive mutex, that thread's own calls neither wait nor give up.
+    std::thread::id wallet_lock_owner;
+    //! Whether the lock stand-in keeps the calling thread out.
+    bool WalletLockExcludesCaller() const { return wallet_lock_held && wallet_lock_owner != std::this_thread::get_id(); }
     bool psbt_sign_entered{false};
     bool allow_psbt_reservation{true};
     bool allow_psbt_completion{true};

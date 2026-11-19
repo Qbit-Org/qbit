@@ -217,9 +217,10 @@ void WalletModel::updateAddressBook(const QString &address, const QString &label
     // address table model, and the transaction list shows its labels.
     // refresh() may since have handed out another one, which the dialog that
     // asked for it shows; nothing shows those it handed out before. Update
-    // the two in use, then have the rows that show this address read their
-    // label again. Listeners may run nested event loops that delete this
-    // model, so check it after each.
+    // the two in use, then have the transaction list notify the rows that
+    // show this address, which it does once this call has returned.
+    // Listeners may run nested event loops that delete this model, so check
+    // it after each.
     QPointer<WalletModel> model{this};
     if (m_complete_address_table_model) m_complete_address_table_model->updateEntry(address, label, isMine, purpose, status);
     if (!model) return;

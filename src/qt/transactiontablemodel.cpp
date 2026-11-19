@@ -20,7 +20,6 @@
 #include <key_io.h>
 #include <tinyformat.h>
 #include <uint256.h>
-#include <util/strencodings.h>
 #include <util/string.h>
 
 #include <algorithm>
@@ -261,6 +260,8 @@ TransactionTableModel::TransactionTableModel(const PlatformStyle *_platformStyle
         platformStyle(_platformStyle)
 {
     subscribeToCoreSignals();
+    connect(this, &QAbstractItemModel::rowsInserted, this, [this] { ++m_row_changes; });
+    connect(this, &QAbstractItemModel::rowsRemoved, this, [this] { ++m_row_changes; });
 
     columns << QString() << tr("Date") << tr("Type") << tr("Label") << QbitUnits::getAmountColumnTitle(walletModel->getOptionsModel()->getDisplayUnit());
     priv->refreshWallet(walletModel->wallet());
@@ -405,48 +406,81 @@ QString TransactionTableModel::lookupAddress(const std::string &address, bool to
     return description;
 }
 
-/* Whether a row whose address is row_address shows the label that the
-   address book holds for the encoded address. Labels are looked up by the
-   row address decoded and encoded again, which gives the row address back
-   when it was encoded from an output. An address the wallet stored as text
-   (RecvFromOther, SendToOther and their coinbase form) can differ from the
-   encoded address only in case and surrounding white space, which decoding
-   ignores, so only such a spelling needs decoding to compare. */
-static bool ShowsLabelOf(const std::string& row_address, const std::string& address)
+/* Whether a row whose address is row_address shows the label of one of the
+   encoded addresses in changed. Labels are looked up by the row address
+   decoded and encoded again, which gives the row address back when it was
+   encoded from an output. An address the wallet stored as text
+   (RecvFromOther, SendToOther and their coinbase form) can decode to
+   another spelling only when it has surrounding white space or no lower
+   case letter, as a bech32 address in upper case, so only such a spelling
+   needs decoding to compare. */
+static bool ShowsChangedLabel(const std::string& row_address, const std::unordered_set<std::string>& changed)
 {
-    if (row_address == address) return true;
-    const std::string_view trimmed{util::TrimStringView(row_address)};
-    if (trimmed.size() != address.size() ||
-        !std::equal(trimmed.begin(), trimmed.end(), address.begin(), [](char a, char b) { return ToLower(a) == ToLower(b); })) {
+    if (changed.count(row_address)) return true;
+    if (util::TrimStringView(row_address).size() == row_address.size() &&
+        std::any_of(row_address.begin(), row_address.end(), [](char c) { return c >= 'a' && c <= 'z'; })) {
         return false;
     }
-    return EncodeDestination(DecodeDestination(row_address)) == address;
+    const CTxDestination destination{DecodeDestination(row_address)};
+    return IsValidDestination(destination) && changed.count(EncodeDestination(destination));
 }
 
 void TransactionTableModel::updateAddressLabel(const QString &address)
 {
     // Rows read their labels from the address table model, not from the
-    // wallet, so nothing reads a changed label again unless told to. Notify
-    // the rows that show this address, and only those (a whole-table change
-    // re-runs every proxy's filter over the full history), so that views,
-    // filters and sorts follow the address book.
-    const std::string encoded{address.toStdString()};
-    std::vector<std::pair<int, int>> ranges;
+    // wallet, so nothing reads a changed label again unless told to. Finding
+    // the rows that show the address takes a pass over the whole history,
+    // and notifying them makes every proxy filter and sort them again, which
+    // reads their status. Do neither inside the wallet's notification, which
+    // holds the wallet lock if the change was made on this thread, and make
+    // one pass for all the addresses changed until the event loop runs it.
+    m_changed_labels.insert(address.toStdString());
+    queueLabelPass();
+}
+
+void TransactionTableModel::queueLabelPass()
+{
+    if (m_label_pass_queued) return;
+    m_label_pass_queued = true;
+    QMetaObject::invokeMethod(this, [this] { updateChangedLabels(); }, Qt::QueuedConnection);
+}
+
+void TransactionTableModel::updateChangedLabels()
+{
+    m_label_pass_queued = false;
+    std::unordered_set<std::string> changed;
+    changed.swap(m_changed_labels);
+    if (changed.empty()) return;
+    ++m_label_passes;
+
+    int first{-1};
+    int last{-1};
     for (int row = 0; row < priv->size(); ++row) {
-        if (!ShowsLabelOf(priv->cachedWallet.at(row).address, encoded)) continue;
-        if (!ranges.empty() && ranges.back().second == row - 1) {
-            ranges.back().second = row;
-        } else {
-            ranges.emplace_back(row, row);
-        }
+        if (!ShowsChangedLabel(priv->cachedWallet.at(row).address, changed)) continue;
+        if (first < 0) first = row;
+        last = row;
     }
-    // A listener may run a nested event loop that deletes this model, or
-    // that adds or removes rows so the row numbers above no longer hold.
+    if (first < 0) return;
+    // Send one signal, from the first to the last row that shows a changed
+    // label. A proxy sorts the rows of a signal again among its other rows,
+    // which it takes to be in order. The rows of one address are scattered,
+    // as rows are ordered by transaction, and all their labels have already
+    // changed, so a proxy sorted on the address column only places them
+    // right if they all come in one signal. A proxy filters every row a
+    // signal covers, whatever its columns, which costs no more than a change
+    // of its search text, but sorts them again only if they include its sort
+    // column. Only the address column shows the label, in its text, colour
+    // and sort key, and the label role is the same for every column, so a
+    // list sorted by date is left as it is.
     QPointer<TransactionTableModel> model{this};
-    const int size{priv->size()};
-    for (const auto& [first, last] : ranges) {
-        Q_EMIT dataChanged(index(first, 0), index(last, columns.length() - 1));
-        if (!model || priv->size() != size) return;
+    const uint64_t row_changes{m_row_changes};
+    Q_EMIT dataChanged(index(first, ToAddress), index(last, ToAddress));
+    // A listener may run a nested event loop that deletes this model, or
+    // that adds or removes rows, so that the listeners after it got row
+    // numbers that no longer hold. Then notify the rows again.
+    if (model && m_row_changes != row_changes) {
+        m_changed_labels.insert(changed.begin(), changed.end());
+        queueLabelPass();
     }
 }
 

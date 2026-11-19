@@ -10,8 +10,11 @@
 #include <QAbstractTableModel>
 #include <QStringList>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace interfaces {
@@ -85,10 +88,17 @@ public:
         released the wallet, whoever started it. */
     void deliverDeferredUpdates();
     /** The address book entry for an encoded address was added, changed or
-        removed. Rows show labels from an address table model, so notify
-        views of the rows that show this address, and only those. Called by
-        the wallet model once its address table models have the update. */
+        removed. Rows show labels from an address table model, so views are
+        notified of the rows that show this address, in one signal for the
+        address column from the first such row to the last. That happens in
+        one pass for every address changed meanwhile, once control has
+        returned to the event loop: this is called from the wallet's
+        notification, which holds the wallet lock when the change was made
+        on this thread. Called by the wallet model once its address table
+        models have the update. */
     void updateAddressLabel(const QString &address);
+    /** Number of label passes over the rows so far, for tests. */
+    uint64_t labelPassCount() const { return m_label_passes; }
 
 private:
     WalletModel *walletModel;
@@ -107,6 +117,14 @@ private:
         the wallet, which blocks while the encryption holds its locks,
         so they wait here for deliverDeferredUpdates(). */
     std::vector<std::function<void()>> m_deferred_updates;
+    /** Encoded addresses whose address book entry changed since the last
+        label pass, and whether the next pass is queued. */
+    std::unordered_set<std::string> m_changed_labels;
+    bool m_label_pass_queued{false};
+    uint64_t m_label_passes{0};
+    /** Counts insertions and removals of rows, so that a label pass whose
+        listeners change the rows can tell that its row numbers are stale. */
+    uint64_t m_row_changes{0};
     const PlatformStyle *platformStyle;
 
     void subscribeToCoreSignals();
@@ -122,6 +140,8 @@ private:
     QString formatTooltip(const TransactionRecord *rec) const;
     QVariant txStatusDecoration(const TransactionRecord *wtx) const;
     QVariant txAddressDecoration(const TransactionRecord *wtx) const;
+    void queueLabelPass();
+    void updateChangedLabels();
 
 public Q_SLOTS:
     /* New transaction, or transaction changed status */
