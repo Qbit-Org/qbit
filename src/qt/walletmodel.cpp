@@ -35,6 +35,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <QDateTime>
@@ -131,7 +132,10 @@ void WalletModel::startPollBalance()
 void WalletModel::setClientModel(ClientModel* client_model)
 {
     m_client_model = client_model;
-    if (!m_client_model) timer->stop();
+    if (!m_client_model) {
+        timer->stop();
+        m_status_refresh_owed_since.reset();
+    }
 }
 
 void WalletModel::updateStatus()
@@ -153,9 +157,19 @@ void WalletModel::updateStatus()
 
 void WalletModel::pollBalanceChanged()
 {
+    // Read the tip's hash and block time together, so the time belongs to
+    // the tip compared here.
+    const ClientModel::BestBlock tip{m_client_model ? m_client_model->getBestBlock() : ClientModel::BestBlock{}};
+    const auto now{m_status_refresh_steady_clock()};
+    if (tip.hash != m_status_refresh_seen_tip) {
+        m_status_refresh_seen_tip = tip.hash;
+        m_status_refresh_tip_changed = now;
+    }
+
     // Avoid recomputing wallet balances unless a TransactionChanged or
-    // BlockTip notification was received.
-    if (!fForceCheckBalanceChanged && m_cached_last_update_tip == getLastBlockProcessed()) return;
+    // BlockTip notification was received, or an owed transaction status
+    // refresh is due: it runs only on a poll that got the wallet's locks.
+    if (!fForceCheckBalanceChanged && m_cached_last_update_tip == tip.hash && !statusRefreshDue(tip.hash, tip.time, now)) return;
 
     // Try to get balances and return early if locks can't be acquired. This
     // avoids the GUI from getting stuck on periodical polls if the core is
@@ -169,14 +183,48 @@ void WalletModel::pollBalanceChanged()
 
     if (fForceCheckBalanceChanged || block_hash != m_cached_last_update_tip) {
         fForceCheckBalanceChanged = false;
+        if (block_hash != m_cached_last_update_tip) m_status_refresh_tip_changed = now;
 
         // Balance and number of transactions might have changed
         m_cached_last_update_tip = block_hash;
 
         checkBalanceChanged(new_balances);
-        if(transactionTableModel)
-            transactionTableModel->updateConfirmations();
+
+        // Transaction statuses might have changed too.
+        if (!m_status_refresh_owed_since) m_status_refresh_owed_since = now;
     }
+
+    if (statusRefreshDue(tip.hash, tip.time, now)) {
+        m_status_refresh_owed_since.reset();
+        if (transactionTableModel) transactionTableModel->updateConfirmations();
+    }
+}
+
+bool WalletModel::statusRefreshDue(const uint256& tip_hash, std::optional<int64_t> tip_time, SteadyClock::time_point now) const
+{
+    if (!m_status_refresh_owed_since) return false;
+
+    // A refresh costs work proportional to the whole transaction history.
+    // It is due on the next poll if the wallet has processed the tip and the
+    // tip is fresh. Otherwise, as while the out-of-sync warning shows and
+    // blocks can arrive on every poll, it waits until neither the tip nor
+    // the wallet's block has changed for the quiet period, or until the
+    // oldest owed change has waited the maximum lag. So when catch-up ends,
+    // or a block that is not fresh arrives on an idle chain, statuses
+    // refresh within a few seconds. A transaction change on a tip that is
+    // not moving is due on the next poll.
+    if (now - m_status_refresh_tip_changed >= STALE_TIP_STATUS_REFRESH_QUIET ||
+        now - *m_status_refresh_owed_since >= STALE_TIP_STATUS_REFRESH_MAX_LAG) {
+        return true;
+    }
+    return m_cached_last_update_tip == tip_hash && tip_time &&
+           GUIUtil::IsBlockTimeFresh(QDateTime::fromSecsSinceEpoch(*tip_time), m_status_refresh_wall_clock());
+}
+
+void WalletModel::setStatusRefreshClocksForTesting(std::function<QDateTime()> wall_clock, std::function<SteadyClock::time_point()> steady_clock)
+{
+    m_status_refresh_wall_clock = std::move(wall_clock);
+    m_status_refresh_steady_clock = std::move(steady_clock);
 }
 
 void WalletModel::checkBalanceChanged(const interfaces::WalletBalances& new_balances)

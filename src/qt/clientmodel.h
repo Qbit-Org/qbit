@@ -77,6 +77,13 @@ public:
     std::map<CNetAddr, LocalServiceInfo> getNetLocalAddresses() const;
     int getNumBlocks() const;
     uint256 getBestBlockHash() EXCLUSIVE_LOCKS_REQUIRED(!m_cached_tip_mutex);
+    //! The best block hash and the time of that same block, read together.
+    struct BestBlock {
+        uint256 hash;
+        //! Unset if the tip changed while it was read from the node.
+        std::optional<int64_t> time;
+    };
+    BestBlock getBestBlock() EXCLUSIVE_LOCKS_REQUIRED(!m_cached_tip_mutex);
     int getHeaderTipHeight() const;
     int64_t getHeaderTipTime() const;
 
@@ -101,6 +108,9 @@ public:
 
     Mutex m_cached_tip_mutex;
     uint256 m_cached_tip_blocks GUARDED_BY(m_cached_tip_mutex){};
+    //! Block time of m_cached_tip_blocks, written with it by block tip
+    //! notifications and getBestBlock(). Unset while only the hash is known.
+    std::optional<int64_t> m_cached_tip_time GUARDED_BY(m_cached_tip_mutex);
 
 private:
     interfaces::Node& m_node;

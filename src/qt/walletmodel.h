@@ -12,10 +12,12 @@
 #include <interfaces/wallet.h>
 #include <primitives/transaction_identifier.h>
 #include <support/allocators/secure.h>
+#include <util/time.h>
 
 #include <atomic>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -178,6 +180,11 @@ public:
 
     uint256 getLastBlockProcessed() const;
 
+    //! Replace the clocks that pace the transaction status refresh: the wall
+    //! clock the tip's block time is compared with, and the steady clock that
+    //! times the wait while the tip is stale.
+    void setStatusRefreshClocksForTesting(std::function<QDateTime()> wall_clock, std::function<SteadyClock::time_point()> steady_clock);
+
     // Retrieve the cached wallet balance
     interfaces::WalletBalances getCachedBalance() const;
 
@@ -276,9 +283,20 @@ private:
     // Block hash denoting when the last balance update was done.
     uint256 m_cached_last_update_tip{};
 
+    //! Set while a transaction status refresh is owed: the steady time of
+    //! the first balance update since the last refresh.
+    std::optional<SteadyClock::time_point> m_status_refresh_owed_since;
+    //! The tip last seen by a poll, and the steady time the tip or the
+    //! wallet's block last changed.
+    uint256 m_status_refresh_seen_tip{};
+    SteadyClock::time_point m_status_refresh_tip_changed{};
+    std::function<QDateTime()> m_status_refresh_wall_clock{[] { return QDateTime::currentDateTime(); }};
+    std::function<SteadyClock::time_point()> m_status_refresh_steady_clock{[] { return SteadyClock::now(); }};
+
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
     void checkBalanceChanged(const interfaces::WalletBalances& new_balances);
+    bool statusRefreshDue(const uint256& tip_hash, std::optional<int64_t> tip_time, SteadyClock::time_point now) const;
 
 Q_SIGNALS:
     // Signal that balance in wallet changed

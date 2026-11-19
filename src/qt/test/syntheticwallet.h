@@ -5,11 +5,14 @@
 #ifndef QBIT_QT_TEST_SYNTHETICWALLET_H
 #define QBIT_QT_TEST_SYNTHETICWALLET_H
 
+#include <consensus/amount.h>
 #include <interfaces/wallet.h>
 #include <primitives/transaction.h>
 #include <psbt.h>
+#include <uint256.h>
 #include <wallet/pqc_usage.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -88,6 +91,13 @@ struct SyntheticWalletState {
     //! TRY_LOCK it stands in for.
     std::optional<interfaces::WalletTx> wallet_tx;
     interfaces::WalletTxStatus wallet_tx_status{};
+    //! The balance getBalances() and tryGetBalances() report, not guarded by
+    //! mutex, and the block tryGetBalances() reports the wallet has processed.
+    std::atomic<CAmount> balance{50 * COIN};
+    uint256 last_block_hash{};
+    //! Calls to tryGetBalances(), each a balance pass over the whole wallet
+    //! in the real one.
+    int try_get_balances_calls{0};
     //! The address book, returned by getAddresses() and searched by
     //! getAddress(). Both wait on the encryption latch.
     std::vector<interfaces::WalletAddress> address_book;
