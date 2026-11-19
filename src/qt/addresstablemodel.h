@@ -80,7 +80,7 @@ public:
         wallet's address book notifications, so the answer lags the wallet
         until those are delivered: use it to show a label, as the transaction
         list does on every repaint and filter pass, not to decide what to
-        write. A pk_hash_only model has no rows for other addresses. */
+        write. */
     QString cachedLabelForAddress(const QString &address) const;
 
     /** Look up purpose for address in address book, if not found return empty string. */

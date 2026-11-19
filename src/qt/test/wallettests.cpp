@@ -4220,6 +4220,15 @@ void NotifyFromOtherThread(const std::function<void()>& notify)
     QCoreApplication::sendPostedEvents();
 }
 
+//! Run a function when leaving the scope. Declared after a JoinOnExit, it
+//! releases the helper thread when a failed check returns early, so the
+//! join does not wait for the thread's bound.
+struct RunOnExit {
+    std::function<void()> run;
+
+    ~RunOnExit() { run(); }
+};
+
 QString TransactionLabel(const TransactionTableModel& table, int row)
 {
     return table.index(row, TransactionTableModel::ToAddress).data(TransactionTableModel::LabelRole).toString();
@@ -4282,7 +4291,15 @@ void TestTransactionLabelsSkipWalletLock(interfaces::Node& node)
         lock.unlock();
         state->condition.notify_all();
     }};
+    const auto finish{[&state, &gui_done] {
+        {
+            std::lock_guard lock{state->mutex};
+            gui_done = true;
+        }
+        state->condition.notify_all();
+    }};
     const JoinOnExit join_holder{holder};
+    const RunOnExit finish_on_exit{finish};
 
     // What a repaint, a tooltip, a copy and an export of each row ask for.
     const std::array<QString, 4> labels{QStringLiteral("alice"), QStringLiteral("bob"), QString{}, QString{}};
@@ -4309,11 +4326,7 @@ void TestTransactionLabelsSkipWalletLock(interfaces::Node& node)
     QCOMPARE(proxy->index(2, 0).data(TransactionTableModel::LabelRole).toString(), QStringLiteral("alice"));
     QCOMPARE(proxy->index(3, 0).data(TransactionTableModel::LabelRole).toString(), QStringLiteral("bob"));
     view.grab();
-    {
-        std::lock_guard lock{state->mutex};
-        gui_done = true;
-    }
-    state->condition.notify_all();
+    finish();
     holder.join();
     QVERIFY2(held_throughout, "GUI thread asked the wallet for a label while another thread held the wallet lock");
 }
@@ -4656,6 +4669,18 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
     QCOMPARE(shown_label(receive_labelled), QStringLiteral("alice3"));
     QCOMPARE(shown_label(send_p2mr), QString{});
 
+    // Each time the message signing dialog opens its address book, the wallet
+    // model hands out another model, and nothing shows the one before. Only
+    // the models in use follow the address book, so an address book change
+    // costs the same however often the dialog has opened it.
+    wallet_model.refresh(/*pk_hash_only=*/true);
+    AddressTableModel* const legacy_only_again{wallet_model.getAddressTableModel()};
+    QVERIFY(legacy_only_again != legacy_only);
+    QVERIFY(wallet->SetAddressBook(legacy, "miner3", /*purpose=*/{}));
+    QCOMPARE(listed_label(*legacy_only_again, legacy), QStringLiteral("miner3"));
+    QCOMPARE(listed_label(*labels, legacy), QStringLiteral("miner3"));
+    QCOMPARE(listed_label(*legacy_only, legacy), QStringLiteral("miner2"));
+
     // Another thread holds the wallet lock, as the wallet does for each block
     // it connects, until the GUI thread is done. The bound only ends a GUI
     // thread that waits for the lock, so no pause of the process can fail
@@ -4678,7 +4703,15 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
         hold_cv.notify_all();
         holder_timed_out = !hold_cv.wait_for(lock, std::chrono::seconds{60}, [&gui_done] { return gui_done; });
     }};
+    const auto finish{[&] {
+        {
+            std::lock_guard lock{hold_mutex};
+            gui_done = true;
+        }
+        hold_cv.notify_all();
+    }};
     const JoinOnExit join_holder{holder};
+    const RunOnExit finish_on_exit{finish};
     {
         std::unique_lock lock{hold_mutex};
         QVERIFY(hold_cv.wait_for(lock, std::chrono::seconds{60}, [&held] { return held; }));
@@ -4696,11 +4729,7 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
     proxy->setSearchString(QString{});
     list->sortByColumn(TransactionTableModel::ToAddress, Qt::AscendingOrder);
     view.grab();
-    {
-        std::lock_guard lock{hold_mutex};
-        gui_done = true;
-    }
-    hold_cv.notify_all();
+    finish();
     holder.join();
     QVERIFY2(!holder_timed_out, "GUI thread waited for the wallet lock while showing transaction labels");
     QCOMPARE(found, 1);
@@ -4797,6 +4826,27 @@ void TestAddressBookChangesWhileModelLoads(interfaces::Node& node)
     const std::array<QString, 7> labels{QStringLiteral("before"), QStringLiteral("during"), QStringLiteral("after"),
                                         QStringLiteral("second"), QString{}, QStringLiteral("new"), QString{}};
     for (int row = 0; row < 7; ++row) QCOMPARE(TransactionLabel(*table, row), labels[row]);
+
+    // A change raised on the GUI thread reaches the wallet model at once, not
+    // queued. The constructor only reads the wallet, so it raises none; if it
+    // did, during the read, the read would include the change, and the
+    // models still under construction must not apply it a second time.
+    auto gui_state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination from_gui{p2mr(0x58)};
+    gui_state->wallet_tx = MakeSyntheticPayment({from_gui}, 6);
+    {
+        std::lock_guard lock{gui_state->mutex};
+        gui_state->get_addresses_entered = SyntheticAddressBookChange(gui_state, from_gui, "gui", wallet::AddressPurpose::RECEIVE, CT_NEW);
+    }
+    auto gui_model{env.makeModel(gui_state)};
+    {
+        std::lock_guard lock{gui_state->mutex};
+        gui_state->get_addresses_entered = {};
+    }
+    QCoreApplication::sendPostedEvents();
+    QCOMPARE(gui_model->getAddressTableModel()->rowCount({}), 1);
+    QCOMPARE(gui_model->getAddressTableModel()->cachedLabelForAddress(QString::fromStdString(EncodeDestination(from_gui))), QStringLiteral("gui"));
+    QCOMPARE(TransactionLabel(*gui_model->getTransactionTableModel(), 0), QStringLiteral("gui"));
 }
 
 //! BitcoinGUI::updateWalletStatus reads the current wallet whenever any wallet

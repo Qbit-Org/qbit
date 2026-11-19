@@ -265,6 +265,10 @@ private:
     OptionsModel *optionsModel;
 
     AddressTableModel* addressTableModel{nullptr};
+    //! The address table model created with this model, which lists every
+    //! address. The address book pages and the transaction list keep it after
+    //! refresh() has replaced addressTableModel.
+    AddressTableModel* m_complete_address_table_model{nullptr};
     TransactionTableModel* transactionTableModel{nullptr};
     RecentRequestsTableModel* recentRequestsTableModel{nullptr};
 

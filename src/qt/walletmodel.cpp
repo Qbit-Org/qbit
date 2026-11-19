@@ -101,6 +101,7 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     // it already has. The other handlers follow in subscribeToCoreSignals().
     m_handler_address_book_changed = m_wallet->handleAddressBookChanged(std::bind(NotifyAddressBookChanged, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
     addressTableModel = new AddressTableModel(this);
+    m_complete_address_table_model = addressTableModel;
     transactionTableModel = new TransactionTableModel(platformStyle, this);
     recentRequestsTableModel = new RecentRequestsTableModel(this);
 
@@ -212,17 +213,18 @@ void WalletModel::updateTransaction()
 void WalletModel::updateAddressBook(const QString &address, const QString &label,
         bool isMine, wallet::AddressPurpose purpose, int status)
 {
-    // refresh() hands out a new address table model and keeps the earlier
-    // ones. The address book pages and the transaction list keep the one
-    // created with this model, which lists every address, and the
-    // transaction list shows its labels. Update each of them, then have the
-    // rows that show this address read their label again. Listeners may run
-    // nested event loops that delete this model, so check it after each.
+    // The address book pages and the transaction list keep the complete
+    // address table model, and the transaction list shows its labels.
+    // refresh() may since have handed out another one, which the dialog that
+    // asked for it shows; nothing shows those it handed out before. Update
+    // the two in use, then have the rows that show this address read their
+    // label again. Listeners may run nested event loops that delete this
+    // model, so check it after each.
     QPointer<WalletModel> model{this};
-    for (AddressTableModel* const table : findChildren<AddressTableModel*>(Qt::FindDirectChildrenOnly)) {
-        table->updateEntry(address, label, isMine, purpose, status);
-        if (!model) return;
-    }
+    if (m_complete_address_table_model) m_complete_address_table_model->updateEntry(address, label, isMine, purpose, status);
+    if (!model) return;
+    if (addressTableModel && addressTableModel != m_complete_address_table_model) addressTableModel->updateEntry(address, label, isMine, purpose, status);
+    if (!model) return;
     if (transactionTableModel) transactionTableModel->updateAddressLabel(address);
 }
 

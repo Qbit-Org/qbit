@@ -170,6 +170,12 @@ public:
         return &*it;
     }
 
+    /* Find the entry for a destination, encoded as the rows are */
+    const AddressTableEntry* find(const CTxDestination& dest) const
+    {
+        return find(QString::fromStdString(EncodeDestination(dest)));
+    }
+
     AddressTableEntry *index(int idx)
     {
         if(idx >= 0 && idx < cachedAddressTable.size())
@@ -440,10 +446,9 @@ QString AddressTableModel::labelForAddress(const QString &address) const
 
 QString AddressTableModel::cachedLabelForAddress(const QString &address) const
 {
-    // Decode and encode the address as getAddressData() does, so that a
-    // non-canonical or invalid string finds the entry the wallet would find.
-    const CTxDestination destination = DecodeDestination(address.toStdString());
-    const AddressTableEntry* entry = priv->find(QString::fromStdString(EncodeDestination(destination)));
+    // Decode the address as getAddressData() does, so that a non-canonical
+    // or invalid string finds the entry the wallet would find.
+    const AddressTableEntry* entry = priv->find(DecodeDestination(address.toStdString()));
     return entry ? entry->label : QString();
 }
 
@@ -465,7 +470,7 @@ bool AddressTableModel::getAddressData(const QString &address,
     // the rows this model already holds. A repaint of the transaction list
     // looks up its labels here without any user input.
     if (walletModel->isEncryptingWallet()) {
-        const AddressTableEntry* entry = priv->find(QString::fromStdString(EncodeDestination(destination)));
+        const AddressTableEntry* entry = priv->find(destination);
         if (!entry) return false;
         if (name) *name = entry->label.toStdString();
         if (purpose) *purpose = translateAddressPurpose(entry->type);
