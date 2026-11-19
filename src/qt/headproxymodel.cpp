@@ -18,7 +18,9 @@ void HeadProxyModel::setSourceModel(QAbstractItemModel* source_model)
     if (source_model == sourceModel()) return;
 
     finishPendingChange();
-    beginResetModel();
+    // A slot on the old source's modelAboutToBeReset can replace the source
+    // while the proxy's own reset is open: end that reset here, once.
+    if (!m_resetting) beginResetModel();
     for (const auto& connection : m_source_connections) disconnect(connection);
     m_source_connections.clear();
     m_resetting = false;
@@ -103,6 +105,9 @@ QVariant HeadProxyModel::headerData(int section, Qt::Orientation orientation, in
 QModelIndex HeadProxyModel::mapToSource(const QModelIndex& proxy_index) const
 {
     if (!proxy_index.isValid() || proxy_index.model() != this || !sourceModel()) return {};
+    // An index kept from before a change can name a row the proxy no longer
+    // shows, while the source still has it.
+    if (proxy_index.row() >= m_rows || proxy_index.column() >= columnCount()) return {};
     return sourceModel()->index(proxy_index.row(), proxy_index.column());
 }
 

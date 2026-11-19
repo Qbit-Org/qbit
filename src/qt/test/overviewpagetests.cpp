@@ -26,7 +26,9 @@
 
 #include <QAbstractItemModelTester>
 #include <QAbstractProxyModel>
+#include <QByteArray>
 #include <QCoreApplication>
+#include <QDebug>
 #include <QEvent>
 #include <QIcon>
 #include <QIdentityProxyModel>
@@ -60,6 +62,10 @@ public:
     explicit ModelMirror(QAbstractItemModel& model) : m_model{model}
     {
         connect(&model, &QAbstractItemModel::rowsInserted, this, [this](const QModelIndex&, int first, int last) {
+            if (first < 0 || first > m_rows.size() || last < first) {
+                m_out_of_range = true;
+                return;
+            }
             for (int row = first; row <= last; ++row) m_rows.insert(row, read(row));
         });
         connect(&model, &QAbstractItemModel::rowsRemoved, this, [this](const QModelIndex&, int first, int last) {
@@ -136,6 +142,27 @@ void CheckHead(const HeadProxyModel& head, const QAbstractItemModel& source, con
         CheckHead((head), (source), (mirror)); \
         if (QTest::currentTestFailed()) return; \
     } while (0)
+
+//! Counts a model's begin and end signals, to check that they pair.
+struct SignalBalance {
+    explicit SignalBalance(QAbstractItemModel& model)
+        : about_to_insert{&model, &QAbstractItemModel::rowsAboutToBeInserted}, inserted{&model, &QAbstractItemModel::rowsInserted},
+          about_to_remove{&model, &QAbstractItemModel::rowsAboutToBeRemoved}, removed{&model, &QAbstractItemModel::rowsRemoved},
+          about_to_lay_out{&model, &QAbstractItemModel::layoutAboutToBeChanged}, laid_out{&model, &QAbstractItemModel::layoutChanged},
+          about_to_reset{&model, &QAbstractItemModel::modelAboutToBeReset}, reset{&model, &QAbstractItemModel::modelReset}
+    {
+    }
+
+    void check() const
+    {
+        QCOMPARE(inserted.count(), about_to_insert.count());
+        QCOMPARE(removed.count(), about_to_remove.count());
+        QCOMPARE(laid_out.count(), about_to_lay_out.count());
+        QCOMPARE(reset.count(), about_to_reset.count());
+    }
+
+    QSignalSpy about_to_insert, inserted, about_to_remove, removed, about_to_lay_out, laid_out, about_to_reset, reset;
+};
 
 void AppendRow(QStandardItemModel& model, const QString& name)
 {
@@ -372,10 +399,10 @@ QStringList VisibleTransactions(const QListView& view)
     return hashes;
 }
 
-int TableRow(const TransactionTableModel& table, const Txid& txid)
+int TableRow(const TransactionTableModel& table, const QString& hash)
 {
     for (int row = 0; row < table.rowCount({}); ++row) {
-        if (table.index(row, 0).data(TransactionTableModel::TxHashRole).toString() == Hash(txid)) return row;
+        if (table.index(row, 0).data(TransactionTableModel::TxHashRole).toString() == hash) return row;
     }
     return -1;
 }
@@ -388,11 +415,7 @@ void CheckDelegateRoles(const QListView& view, const TransactionTableModel& tabl
     for (int row = 0; row < model->rowCount(); ++row) {
         if (view.isRowHidden(row)) continue;
         const QModelIndex shown{model->index(row, TransactionTableModel::ToAddress)};
-        const QString hash{shown.data(TransactionTableModel::TxHashRole).toString()};
-        int table_row{-1};
-        for (int i = 0; i < table.rowCount({}); ++i) {
-            if (table.index(i, 0).data(TransactionTableModel::TxHashRole).toString() == hash) table_row = i;
-        }
+        const int table_row{TableRow(table, shown.data(TransactionTableModel::TxHashRole).toString())};
         QVERIFY(table_row >= 0);
         const QModelIndex source{table.index(table_row, TransactionTableModel::ToAddress)};
         for (const int role : {int{Qt::DisplayRole}, int{Qt::ForegroundRole}, int{TransactionTableModel::DateRole},
@@ -416,7 +439,7 @@ void CheckDelegateRoles(const QListView& view, const TransactionTableModel& tabl
 void RefreshRow(TransactionTableModel& table, qt_test::SyntheticWalletState& state, const Txid& txid)
 {
     NotifyTx(state, txid, CT_UPDATED);
-    const int row{TableRow(table, txid)};
+    const int row{TableRow(table, Hash(txid))};
     QVERIFY(row >= 0);
     Q_EMIT table.dataChanged(table.index(row, 0), table.index(row, TransactionTableModel::Amount));
 }
@@ -657,6 +680,156 @@ void OverviewPageTests::headProxyModelBoundedWork()
     QVERIFY(ChainPersistentIndexes(&head) <= 2 * NUM_ITEMS);
 }
 
+void OverviewPageTests::headProxyModelSourceChanges()
+{
+    const QStringList letters{"a", "b", "c", "d", "e", "f", "g"};
+
+    // A second source replaces the first, which stops driving the head.
+    {
+        QStringListModel first{letters};
+        QStringListModel second{{"x", "y", "z"}};
+        HeadProxyModel head{NUM_ITEMS};
+        head.setSourceModel(&first);
+        QAbstractItemModelTester tester{&head, QAbstractItemModelTester::FailureReportingMode::QtTest};
+        ModelMirror mirror{head};
+        const SignalBalance balance{head};
+        head.setSourceModel(&second);
+        CHECK_HEAD(head, second, mirror);
+
+        QSignalSpy rows_inserted{&head, &QAbstractItemModel::rowsInserted};
+        QSignalSpy rows_removed{&head, &QAbstractItemModel::rowsRemoved};
+        QSignalSpy data_changed{&head, &QAbstractItemModel::dataChanged};
+        QSignalSpy layout_changed{&head, &QAbstractItemModel::layoutChanged};
+        QSignalSpy model_reset{&head, &QAbstractItemModel::modelReset};
+        QVERIFY(first.insertRows(0, 1));
+        first.setData(first.index(0), QStringLiteral("n"));
+        QVERIFY(first.removeRows(2, 2));
+        first.sort(0, Qt::DescendingOrder);
+        first.setStringList({"q"});
+        QCOMPARE(rows_inserted.count(), 0);
+        QCOMPARE(rows_removed.count(), 0);
+        QCOMPARE(data_changed.count(), 0);
+        QCOMPARE(layout_changed.count(), 0);
+        QCOMPARE(model_reset.count(), 0);
+        CHECK_HEAD(head, second, mirror);
+        balance.check();
+        if (QTest::currentTestFailed()) return;
+    }
+
+    // A slot on the source's modelAboutToBeReset, run after the head's own,
+    // replaces the source while the head's reset is open. The head ends that
+    // reset once.
+    {
+        QStringListModel first{letters};
+        QStringListModel second{{"x", "y", "z"}};
+        HeadProxyModel head{NUM_ITEMS};
+        head.setSourceModel(&first);
+        QAbstractItemModelTester tester{&head, QAbstractItemModelTester::FailureReportingMode::QtTest};
+        ModelMirror mirror{head};
+        const SignalBalance balance{head};
+        QObject::connect(&first, &QAbstractItemModel::modelAboutToBeReset, &head, [&] { head.setSourceModel(&second); });
+        first.setStringList({"r"});
+        QCOMPARE(balance.about_to_reset.count(), 1);
+        balance.check();
+        if (QTest::currentTestFailed()) return;
+        CHECK_HEAD(head, second, mirror);
+    }
+
+    // A slot on the source's change signal, run before the head's own, resets
+    // or replaces the source while the head's matching change is open. The
+    // head ends its change before its reset.
+    for (const bool replace : {false, true}) {
+        for (const char* change : {"insert", "remove", "layout"}) {
+            QStringListModel source{letters};
+            QStringListModel other{{"x", "y"}};
+            HeadProxyModel head{NUM_ITEMS};
+            bool acted{false};
+            const auto act{[&] {
+                if (acted) return;
+                acted = true;
+                if (replace) {
+                    head.setSourceModel(&other);
+                } else {
+                    source.setStringList({"r", "s", "t"});
+                }
+            }};
+            const QByteArray name{change};
+            if (name == "insert") QObject::connect(&source, &QAbstractItemModel::rowsInserted, &head, act);
+            if (name == "remove") QObject::connect(&source, &QAbstractItemModel::rowsRemoved, &head, act);
+            if (name == "layout") QObject::connect(&source, &QAbstractItemModel::layoutChanged, &head, act);
+            head.setSourceModel(&source);
+            QAbstractItemModelTester tester{&head, QAbstractItemModelTester::FailureReportingMode::QtTest};
+            ModelMirror mirror{head};
+            const SignalBalance balance{head};
+            if (name == "insert") QVERIFY(source.insertRows(0, 1));
+            if (name == "remove") QVERIFY(source.removeRows(0, 2));
+            if (name == "layout") source.sort(0, Qt::DescendingOrder);
+            QVERIFY2(acted, change);
+            balance.check();
+            if (QTest::currentTestFailed()) {
+                qWarning() << "while the head's" << change << "was open, the source was" << (replace ? "replaced" : "reset");
+                return;
+            }
+            CHECK_HEAD(head, replace ? other : source, mirror);
+        }
+    }
+
+    // A source destroyed while the head's change is open would have to be
+    // deleted inside its own change signal, which no model supports, so that
+    // case is not exercised; destruction otherwise resets the head (see
+    // headProxyModelTests).
+
+    // An index kept from before a change names a row the head no longer
+    // shows: it maps to no source row, although the source still has one
+    // there.
+    {
+        QStringListModel source{letters};
+        HeadProxyModel head{NUM_ITEMS};
+        head.setSourceModel(&source);
+        QAbstractItemModelTester tester{&head, QAbstractItemModelTester::FailureReportingMode::QtTest};
+        const QModelIndex stale{head.index(NUM_ITEMS - 1, 0)};
+        int checked{0};
+        bool mapped{false};
+        QObject::connect(&head, &QAbstractItemModel::rowsRemoved, &head, [&] {
+            // The row pushed out of the head leaves before the source inserts
+            // its new first row, so the source still has the stale row.
+            ++checked;
+            mapped = mapped || head.mapToSource(stale).isValid();
+            QVERIFY(source.index(NUM_ITEMS - 1, 0).isValid());
+        });
+        QVERIFY(source.insertRows(0, 1));
+        QCOMPARE(checked, 1);
+        QVERIFY(!mapped);
+        QVERIFY(!head.mapToSource(head.index(0, 1)).isValid());
+    }
+
+    // Vertical header changes reach the head for its own rows only.
+    {
+        QStandardItemModel source{7, 2};
+        HeadProxyModel head{NUM_ITEMS};
+        head.setSourceModel(&source);
+        QAbstractItemModelTester tester{&head, QAbstractItemModelTester::FailureReportingMode::QtTest};
+        QSignalSpy header{&head, &QAbstractItemModel::headerDataChanged};
+        Q_EMIT source.headerDataChanged(Qt::Vertical, 3, 6);
+        QCOMPARE(header.count(), 1);
+        QCOMPARE(qvariant_cast<Qt::Orientation>(header.at(0).at(0)), Qt::Vertical);
+        QCOMPARE(header.at(0).at(1).toInt(), 3);
+        QCOMPARE(header.at(0).at(2).toInt(), NUM_ITEMS - 1);
+        Q_EMIT source.headerDataChanged(Qt::Vertical, NUM_ITEMS, 6);
+        QCOMPARE(header.count(), 1);
+        Q_EMIT source.headerDataChanged(Qt::Horizontal, 0, 1);
+        QCOMPARE(header.count(), 2);
+        QCOMPARE(qvariant_cast<Qt::Orientation>(header.at(1).at(0)), Qt::Horizontal);
+        QCOMPARE(header.at(1).at(2).toInt(), 1);
+        QVERIFY(source.setHeaderData(1, Qt::Vertical, QStringLiteral("one")));
+        QCOMPARE(header.count(), 3);
+        QCOMPARE(head.headerData(1, Qt::Vertical).toString(), QStringLiteral("one"));
+        QVERIFY(source.setHeaderData(NUM_ITEMS, Qt::Vertical, QStringLiteral("unseen")));
+        QCOMPARE(header.count(), 3);
+        QVERIFY(!head.headerData(NUM_ITEMS, Qt::Vertical).isValid());
+    }
+}
+
 void OverviewPageTests::recentTransactionsTests()
 {
     OverviewEnvironment env{m_node};
@@ -827,9 +1000,11 @@ void OverviewPageTests::recentTransactionsLongHistory()
     QVERIFY(recent);
     overview.grab();
 
-    // The list's model has only the rows shown, and neither the list nor
-    // the models under it keep state for each row of the history, which
-    // they would have to update on every change of the history.
+    // The list's model has only the rows shown, the list hides no rows, and
+    // neither the list nor the models under it hold persistent indexes, which
+    // a model updates on every change of its rows, for the rest of the
+    // history. (The filter proxy still keeps its own mapping of the whole
+    // history; that is outside what this checks.)
     const auto check_bounded{[&] {
         const qsizetype persistent{ChainPersistentIndexes(recent->model())};
         qInfo() << "recent transactions: model rows" << recent->model()->rowCount() << "persistent indexes" << persistent;

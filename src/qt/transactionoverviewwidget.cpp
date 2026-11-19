@@ -26,8 +26,8 @@ QSize TransactionOverviewWidget::sizeHint() const
     // rows hidden: one row's height for each of them.
     if (const auto* head{qobject_cast<const HeadProxyModel*>(model())}; head && head->sourceModel() && head->rowCount() > 0) {
         const qint64 more_rows{head->sourceModel()->rowCount() - head->rowCount()};
-        if (more_rows > 0) {
-            const qint64 row_height{sizeHintForIndex(head->index(0, modelColumn())).height()};
+        const qint64 row_height{sizeHintForIndex(head->index(0, modelColumn())).height()};
+        if (more_rows > 0 && row_height > 0) {
             height = static_cast<int>(std::min<qint64>(QWIDGETSIZE_MAX, height + more_rows * row_height));
         }
     }

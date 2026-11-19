@@ -25,6 +25,7 @@ private:
 private Q_SLOTS:
     void headProxyModelTests();
     void headProxyModelBoundedWork();
+    void headProxyModelSourceChanges();
     void recentTransactionsTests();
     void recentTransactionsLongHistory();
 };
