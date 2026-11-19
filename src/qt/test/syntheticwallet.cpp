@@ -197,6 +197,7 @@ public:
     {
         std::unique_lock lock{m_state->mutex};
         ++m_state->get_address_calls;
+        m_state->condition.notify_all();
         WaitForEncryption(lock);
         for (const auto& entry : m_state->address_book) {
             if (entry.dest != dest) continue;

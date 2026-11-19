@@ -91,7 +91,8 @@ struct SyntheticWalletState {
     //! The address book, returned by getAddresses() and searched by
     //! getAddress(). Both wait on the encryption latch.
     std::vector<interfaces::WalletAddress> address_book;
-    //! Number of getAddress() calls, counted before the call waits.
+    //! Number of getAddress() calls, counted before the call waits, with
+    //! condition notified so a test can see the call.
     int get_address_calls{0};
     //! Listener for the address book notification, so a test can raise it
     //! the way the wallet does after changing address_book.

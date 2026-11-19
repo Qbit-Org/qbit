@@ -4209,12 +4209,15 @@ std::function<void()> SyntheticTransactionChange(const std::shared_ptr<qt_test::
 }
 
 //! Raise wallet notifications from another thread, as the wallet does when an
-//! RPC or a connected block changes it, so the models receive them queued.
-//! The notifications only post events, so the thread cannot wait on the GUI.
+//! RPC or a connected block changes it, so the models receive them queued,
+//! then deliver them as the event loop does. The notifications only post
+//! events, so the thread cannot wait on the GUI thread, and everything they
+//! posted is queued once it has ended.
 void NotifyFromOtherThread(const std::function<void()>& notify)
 {
     std::thread thread{notify};
     thread.join();
+    QCoreApplication::sendPostedEvents();
 }
 
 QString TransactionLabel(const TransactionTableModel& table, int row)
@@ -4257,7 +4260,10 @@ void TestTransactionLabelsSkipWalletLock(interfaces::Node& node)
     QCOMPARE(proxy->rowCount({}), 4);
 
     // Another thread takes the wallet lock and holds it until the GUI thread
-    // is done, or for five seconds if the GUI thread waits for it.
+    // is done. It lets go as soon as the GUI thread asks the wallet for an
+    // address, a call that waits for the lock, so that the test fails at once
+    // rather than hanging; the bound only ends a GUI thread that never
+    // finishes, and no pause of the process can fail the test.
     int calls_before{0};
     {
         std::lock_guard lock{state->mutex};
@@ -4265,21 +4271,18 @@ void TestTransactionLabelsSkipWalletLock(interfaces::Node& node)
         calls_before = state->get_address_calls;
     }
     bool gui_done{false};
-    std::thread holder{[state, &gui_done] {
+    bool held_throughout{false};
+    std::thread holder{[state, &gui_done, &held_throughout, calls_before] {
         std::unique_lock lock{state->mutex};
-        if (!state->condition.wait_for(lock, std::chrono::seconds{5}, [&gui_done] { return gui_done; })) {
-            state->watchdog_released = true;
-        }
+        const bool woken{state->condition.wait_for(lock, std::chrono::seconds{60}, [&] {
+            return gui_done || state->get_address_calls != calls_before;
+        })};
+        held_throughout = woken && state->get_address_calls == calls_before;
         state->wallet_lock_held = false;
         lock.unlock();
         state->condition.notify_all();
     }};
     const JoinOnExit join_holder{holder};
-
-    int gui_ticks{0};
-    QTimer gui_latch;
-    QObject::connect(&gui_latch, &QTimer::timeout, [&gui_ticks] { ++gui_ticks; });
-    gui_latch.start(0);
 
     // What a repaint, a tooltip, a copy and an export of each row ask for.
     const std::array<QString, 4> labels{QStringLiteral("alice"), QStringLiteral("bob"), QString{}, QString{}};
@@ -4306,18 +4309,13 @@ void TestTransactionLabelsSkipWalletLock(interfaces::Node& node)
     QCOMPARE(proxy->index(2, 0).data(TransactionTableModel::LabelRole).toString(), QStringLiteral("alice"));
     QCOMPARE(proxy->index(3, 0).data(TransactionTableModel::LabelRole).toString(), QStringLiteral("bob"));
     view.grab();
-    const int ticks_at_hold{gui_ticks};
-    const bool responsive{WaitUntil([&gui_ticks, ticks_at_hold] { return gui_ticks > ticks_at_hold + 20; }, 5000)};
     {
         std::lock_guard lock{state->mutex};
         gui_done = true;
     }
     state->condition.notify_all();
     holder.join();
-    QVERIFY2(!SyntheticStateMatches(state, [](const auto& value) { return value.watchdog_released; }),
-             "GUI thread waited for the wallet lock while showing transaction labels");
-    QVERIFY(responsive);
-    QVERIFY(SyntheticStateMatches(state, [calls_before](const auto& value) { return value.get_address_calls == calls_before; }));
+    QVERIFY2(held_throughout, "GUI thread asked the wallet for a label while another thread held the wallet lock");
 }
 
 //! What one order of delivering a payment and its label left behind.
@@ -4351,18 +4349,18 @@ void DeliverPaymentAndLabel(SyntheticModelEnvironment& env, bool label_first, La
     const auto label{SyntheticAddressBookChange(state, carol, "carol", wallet::AddressPurpose::RECEIVE, CT_NEW)};
     if (label_first) {
         NotifyFromOtherThread(label);
-        QVERIFY(WaitUntil([addresses] { return addresses->rowCount({}) == 1; }, 5000));
+        QCOMPARE(addresses->rowCount({}), 1);
         QCOMPARE(table->rowCount({}), 0);
         NotifyFromOtherThread(payment);
-        QVERIFY(WaitUntil([table] { return table->rowCount({}) == 1; }, 5000));
+        QCOMPARE(table->rowCount({}), 1);
     } else {
         // The payment arrives first, as when an RPC sends it and then sets
         // the label: the search hides the row while its label is unknown.
         NotifyFromOtherThread(payment);
-        QVERIFY(WaitUntil([table] { return table->rowCount({}) == 1; }, 5000));
+        QCOMPARE(table->rowCount({}), 1);
         QCOMPARE(proxy->rowCount({}), 0);
         NotifyFromOtherThread(label);
-        QVERIFY(WaitUntil([addresses] { return addresses->rowCount({}) == 1; }, 5000));
+        QCOMPARE(addresses->rowCount({}), 1);
     }
     // Shown once both have been delivered, without any later event.
     QCOMPARE(proxy->rowCount({}), 1);
@@ -4374,8 +4372,6 @@ void DeliverPaymentAndLabel(SyntheticModelEnvironment& env, bool label_first, La
         SyntheticAddressBookChange(state, carol, "carol", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
         SyntheticTransactionChange(state, MakeSyntheticPayment({carol}, 2), CT_UPDATED)();
     });
-    QCoreApplication::sendPostedEvents();
-    QCoreApplication::processEvents();
     outcome = {
         .table_rows = table->rowCount({}),
         .shown_rows = proxy->rowCount({}),
@@ -4467,7 +4463,6 @@ void TestLabelChangeUpdatesItsRows(interfaces::Node& node)
     // Relabel bob from another thread, as the setlabel RPC does.
     changed.clear();
     NotifyFromOtherThread(SyntheticAddressBookChange(state, bob, "carol", wallet::AddressPurpose::RECEIVE, CT_UPDATED));
-    QVERIFY(WaitUntil([&changed] { return !changed.isEmpty(); }, 5000));
     QCOMPARE(changed_rows(), (std::set<int>{1}));
     QCOMPARE(TransactionLabel(*table, 1), QStringLiteral("carol"));
     QCOMPARE(proxy->rowCount({}), 1);
@@ -4621,7 +4616,8 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
         wallet->SetAddressBook(removed, "dave2", wallet::AddressPurpose::SEND);
     }};
     rpc.join();
-    QVERIFY(WaitUntil([&shown_label, &removed] { return shown_label(removed) == QStringLiteral("dave2"); }, 5000));
+    QCoreApplication::sendPostedEvents();
+    QCOMPARE(shown_label(removed), QStringLiteral("dave2"));
     VerifyLabelsMatchWallet(wallet_model, addresses);
     if (QTest::currentTestFailed()) return;
 
@@ -4648,8 +4644,9 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
     QCOMPARE(shown_label(send_p2mr), QString{});
 
     // Another thread holds the wallet lock, as the wallet does for each block
-    // it connects, until the GUI thread is done or for five seconds if the
-    // GUI thread waits for it. Read, paint, filter and sort the list.
+    // it connects, until the GUI thread is done. The bound only ends a GUI
+    // thread that waits for the lock, so no pause of the process can fail
+    // the test. Read, paint, filter and sort the list meanwhile.
     TransactionView& view{mini_gui.transactionView};
     view.resize(1000, 600);
     TransactionFilterProxy* const proxy{view.findChild<TransactionFilterProxy*>()};
@@ -4666,7 +4663,7 @@ void TestTransactionLabelsMatchWallet(interfaces::Node& node)
         std::unique_lock lock{hold_mutex};
         held = true;
         hold_cv.notify_all();
-        holder_timed_out = !hold_cv.wait_for(lock, std::chrono::seconds{5}, [&gui_done] { return gui_done; });
+        holder_timed_out = !hold_cv.wait_for(lock, std::chrono::seconds{60}, [&gui_done] { return gui_done; });
     }};
     const JoinOnExit join_holder{holder};
     {
