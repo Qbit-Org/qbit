@@ -4563,6 +4563,7 @@ void TestLabelChangeBurstMakesOnePass(interfaces::Node& node)
     SyntheticModelEnvironment env{node};
     constexpr int ADDRESSES{20};
     std::vector<CTxDestination> book;
+    book.reserve(ADDRESSES);
     for (int i = 0; i < ADDRESSES; ++i) book.emplace_back(WitnessV2P2MR{uint256{static_cast<uint8_t>(0x60 + i)}});
     // Each address is shown by three rows, apart from each other.
     std::vector<CTxDestination> outputs;
@@ -4643,6 +4644,7 @@ void TestLabelChangeSendsOneSignal(interfaces::Node& node)
     // Alice shows every other row, so each of her rows is a range of its own.
     constexpr int ROWS{200};
     std::vector<CTxDestination> outputs;
+    outputs.reserve(ROWS);
     for (int row = 0; row < ROWS; ++row) outputs.push_back(row % 2 == 0 ? alice : bob);
     state->wallet_tx = MakeSyntheticPayment(outputs, 6);
 
