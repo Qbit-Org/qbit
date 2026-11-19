@@ -73,3 +73,15 @@ std::string LogCapture::find(const std::vector<std::string>& texts) const
     }
     return {};
 }
+
+std::vector<std::string> LogCapture::findAll(const std::vector<std::string>& texts) const
+{
+    std::lock_guard lock{m_mutex};
+    std::vector<std::string> result;
+    for (const std::string& line : m_lines) {
+        bool all{true};
+        for (const std::string& text : texts) all = all && line.find(text) != std::string::npos;
+        if (all) result.push_back(line);
+    }
+    return result;
+}

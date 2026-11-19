@@ -46,6 +46,8 @@ public:
 
     //! The first captured line that contains every given text, or empty.
     std::string find(const std::vector<std::string>& texts) const;
+    //! Every captured line that contains every given text.
+    std::vector<std::string> findAll(const std::vector<std::string>& texts) const;
 
 private:
     mutable std::mutex m_mutex;

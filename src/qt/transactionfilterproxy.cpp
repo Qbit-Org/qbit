@@ -30,24 +30,24 @@ bool TransactionFilterProxy::filterAcceptsRow(int sourceRow, const QModelIndex &
     if (!(TYPE(type) & typeFilter))
         return false;
 
-    QDateTime datetime = index.data(TransactionTableModel::DateRole).toDateTime();
-    if (dateFrom && datetime < *dateFrom) return false;
-    if (dateTo && datetime > *dateTo) return false;
-
-    QString address = index.data(TransactionTableModel::AddressRole).toString();
-    QString label = index.data(TransactionTableModel::LabelRole).toString();
-    QString txid = index.data(TransactionTableModel::TxHashRole).toString();
-    if (!address.contains(m_search_string, Qt::CaseInsensitive) &&
-        !  label.contains(m_search_string, Qt::CaseInsensitive) &&
-        !   txid.contains(m_search_string, Qt::CaseInsensitive)) {
-        return false;
-    }
-
     qint64 amount = llabs(index.data(TransactionTableModel::AmountRole).toLongLong());
     if (amount < minAmount)
         return false;
 
-    return true;
+    // The date is converted to local time, so read it only for a date range.
+    if (dateFrom || dateTo) {
+        QDateTime datetime = index.data(TransactionTableModel::DateRole).toDateTime();
+        if (dateFrom && datetime < *dateFrom) return false;
+        if (dateTo && datetime > *dateTo) return false;
+    }
+
+    // Every string contains the empty string, so an empty search accepts the
+    // row without reading the address, txid and label. Of those, the txid is
+    // hex-encoded and the label waits for the wallet lock, so they go last.
+    if (m_search_string.isEmpty()) return true;
+    return index.data(TransactionTableModel::AddressRole).toString().contains(m_search_string, Qt::CaseInsensitive) ||
+           index.data(TransactionTableModel::TxHashRole).toString().contains(m_search_string, Qt::CaseInsensitive) ||
+           index.data(TransactionTableModel::LabelRole).toString().contains(m_search_string, Qt::CaseInsensitive);
 }
 
 void TransactionFilterProxy::setDateRange(const std::optional<QDateTime>& from, const std::optional<QDateTime>& to)

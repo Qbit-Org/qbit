@@ -75,6 +75,8 @@ private:
     std::string m_psbt_reserved_signed;
     bool m_wallet_dependents_destroyed_before_model{false};
     bool m_remove_test_wallet_settings{false};
+    //! Whether the qt log category was enabled before appTests() enabled it.
+    bool m_qt_category_was_enabled{true};
 };
 
 #endif // QBIT_QT_TEST_APPTESTS_H

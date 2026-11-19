@@ -546,13 +546,11 @@ public:
         if (m_state->wallet_tx) return {*m_state->wallet_tx};
         return {};
     }
-    bool tryGetTxStatus(const Txid& txid, interfaces::WalletTxStatus& tx_status, int& num_blocks, int64_t& block_time) override
+    bool tryGetTxStatus(const Txid& txid, interfaces::WalletTxStatus& tx_status) override
     {
         std::lock_guard lock{m_state->mutex};
         if (m_state->encrypt_in_progress || !m_state->wallet_tx || m_state->wallet_tx->tx->GetHash() != txid) return false;
         tx_status = m_state->wallet_tx_status;
-        num_blocks = tx_status.block_height;
-        block_time = 0;
         return true;
     }
     interfaces::WalletTx getWalletTxDetails(const Txid&, interfaces::WalletTxStatus&, interfaces::WalletOrderForm&, bool&, int&) override

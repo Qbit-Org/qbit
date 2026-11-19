@@ -10,6 +10,7 @@
 #include <qt/guiconstants.h>
 #include <qt/test/apptests.h>
 #include <qt/test/clientmodeltests.h>
+#include <qt/test/guistallmonitortests.h>
 #include <qt/test/modaloverlaytests.h>
 #include <qt/test/optiontests.h>
 #include <qt/test/pokertests.h>
@@ -22,6 +23,7 @@
 #include <qt/test/addressbooktests.h>
 #include <qt/test/psbtoperationsdialogtests.h>
 #include <qt/test/quitmodaltests.h>
+#include <qt/test/transactionfilterproxytests.h>
 #include <qt/test/transactionrecordtests.h>
 #include <qt/test/walletcontrollertests.h>
 #include <qt/test/walletactivitytests.h>
@@ -124,9 +126,15 @@ int main(int argc, char* argv[])
         RPCNestedTests test3(app.node());
         num_test_failures += QTest::qExec(&test3);
 
+        GuiStallMonitorTests gui_stall_monitor_tests;
+        num_test_failures += QTest::qExec(&gui_stall_monitor_tests);
+
 #ifdef ENABLE_WALLET
         TransactionRecordTests transaction_record_tests;
         num_test_failures += QTest::qExec(&transaction_record_tests);
+
+        TransactionFilterProxyTests transaction_filter_proxy_tests;
+        num_test_failures += QTest::qExec(&transaction_filter_proxy_tests);
 
         WalletTests test5(app.node());
         num_test_failures += QTest::qExec(&test5);
