@@ -237,6 +237,10 @@ void AppTests::appTests()
     connect(&m_app, &BitcoinApplication::windowShown, this, &AppTests::guiTests);
     expectCallback("guiTests");
     m_app.baseInitialize();
+    // Run the GUI stall monitor, so that shutdown runs with it. cleanup()
+    // restores the category.
+    m_qt_category_was_enabled = (LogInstance().GetCategoryMask() & BCLog::QT) != 0;
+    LogInstance().EnableCategory(BCLog::QT);
     m_app.requestInitialize();
     m_app.exec();
 
@@ -396,6 +400,7 @@ void AppTests::appTests()
         return value.psbt_sign_finished && value.psbt_counters_reserved && !value.psbt_cancel_observed;
     }));
     QVERIFY2(psbt_signed_logged, "Qt wallet shutdown dropped a PSBT signed after counter reservation without logging it");
+    QVERIFY2(!log.find({"GUI stall monitor stopped"}).empty(), "Qt shutdown did not stop the GUI stall monitor");
     QCOMPARE(psbt_files_saved.size(), size_t{1});
     QVERIFY(psbt_files_saved.begin()->second == m_psbt_reserved_signed);
     // The dialog destroyed marker is recorded directly on this thread inside
@@ -440,6 +445,7 @@ void AppTests::cleanup()
 
     // Reset global state even when a QVERIFY returns early from appTests().
     LogInstance().DisconnectTestLogger();
+    if (!m_qt_category_was_enabled) LogInstance().DisableCategory(BCLog::QT);
 
 #ifdef ENABLE_WALLET
     QVERIFY(settings_written);

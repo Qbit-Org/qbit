@@ -124,7 +124,7 @@ public:
 
     /** Update status from core wallet tx.
      */
-    void updateStatus(const interfaces::WalletTxStatus& wtx, const uint256& block_hash, int numBlocks, int64_t block_time);
+    void updateStatus(const interfaces::WalletTxStatus& wtx, const uint256& block_hash);
 
     /** Return whether a status update is needed.
      */

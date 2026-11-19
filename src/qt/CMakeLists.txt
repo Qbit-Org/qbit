@@ -77,6 +77,8 @@ add_library(bitcoinqt STATIC EXCLUDE_FROM_ALL
   csvmodelwriter.h
   freespacechecker.cpp
   freespacechecker.h
+  guistallmonitor.cpp
+  guistallmonitor.h
   guiutil.cpp
   guiutil.h
   initexecutor.cpp

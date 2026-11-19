@@ -7,6 +7,7 @@
 #include <common/args.h>
 #include <logging.h>
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iterator>
@@ -63,13 +64,28 @@ LogCapture::~LogCapture()
     LogInstance().DeleteCallback(m_callback);
 }
 
+namespace {
+bool ContainsAll(const std::string& line, const std::vector<std::string>& texts)
+{
+    return std::ranges::all_of(texts, [&line](const std::string& text) { return line.find(text) != std::string::npos; });
+}
+} // namespace
+
 std::string LogCapture::find(const std::vector<std::string>& texts) const
 {
     std::lock_guard lock{m_mutex};
     for (const std::string& line : m_lines) {
-        bool all{true};
-        for (const std::string& text : texts) all = all && line.find(text) != std::string::npos;
-        if (all) return line;
+        if (ContainsAll(line, texts)) return line;
     }
     return {};
+}
+
+std::vector<std::string> LogCapture::findAll(const std::vector<std::string>& texts) const
+{
+    std::lock_guard lock{m_mutex};
+    std::vector<std::string> result;
+    for (const std::string& line : m_lines) {
+        if (ContainsAll(line, texts)) result.push_back(line);
+    }
+    return result;
 }

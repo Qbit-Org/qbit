@@ -62,6 +62,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -5461,6 +5462,73 @@ void TestEncryptWalletRpcWaitingForKeypoolTopUp(interfaces::Node& node)
     QCOMPARE(status_changed.count(), 1);
 }
 
+//! TransactionTablePriv::index() reads the status of each stale row with
+//! tryGetTxStatus() on the GUI thread, once per row per block. Validation
+//! holds cs_main while it connects a block, so the read must not wait for it.
+void TestTxStatusReadDoesNotWaitForCsMain(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    node.setContext(&test.m_node);
+    const std::shared_ptr<CWallet> wallet{wallet::CreateSyncedWallet(
+        *test.m_node.chain,
+        WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain()),
+        test.coinbaseKey,
+        QT_WALLET_BECH32_DESCRIPTOR_OUTPUT_TYPES,
+        /*keypool_size=*/1)};
+    const std::unique_ptr<interfaces::Wallet> wallet_interface{interfaces::MakeWallet(*node.walletLoader().context(), wallet)};
+    const Txid txid{WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.empty() ? Txid{} : wallet->mapWallet.begin()->first)};
+    QVERIFY(!txid.IsNull());
+
+    // An unconfirmed transaction of the wallet's own, spending a coinbase
+    // output, takes the path of the status read that checks the mempool state
+    // and the trust of its parents.
+    const Txid unconfirmed_txid{[&] {
+        LOCK(wallet->cs_wallet);
+        const CTxOut& coinbase_out{wallet->mapWallet.at(txid).tx->vout.at(0)};
+        CMutableTransaction spend;
+        spend.vin.emplace_back(COutPoint{txid, 0});
+        spend.vout.emplace_back(coinbase_out.nValue - 1000, coinbase_out.scriptPubKey);
+        const wallet::CWalletTx* const wtx{wallet->AddToWallet(MakeTransactionRef(std::move(spend)), wallet::TxStateInMempool{})};
+        return wtx ? wtx->GetHash() : Txid{};
+    }()};
+    QVERIFY(!unconfirmed_txid.IsNull());
+
+    const auto read_status{[&wallet_interface](const Txid& id) -> std::optional<interfaces::WalletTxStatus> {
+        interfaces::WalletTxStatus status;
+        if (!wallet_interface->tryGetTxStatus(id, status)) return std::nullopt;
+        return status;
+    }};
+    const std::optional<interfaces::WalletTxStatus> confirmed_free{read_status(txid)};
+    QVERIFY(confirmed_free);
+    QVERIFY(confirmed_free->depth_in_main_chain > 0);
+
+    // Read both statuses on another thread while this one holds cs_main.
+    using Statuses = std::pair<std::optional<interfaces::WalletTxStatus>, std::optional<interfaces::WalletTxStatus>>;
+    std::packaged_task<Statuses()> read{[&] { return Statuses{read_status(txid), read_status(unconfirmed_txid)}; }};
+    std::future<Statuses> read_result{read.get_future()};
+    std::thread reader;
+    bool returned_while_held{false};
+    {
+        LOCK(::cs_main);
+        reader = std::thread{std::move(read)};
+        returned_while_held = read_result.wait_for(std::chrono::seconds{10}) == std::future_status::ready;
+    }
+    // A read that waits for cs_main returns once it is released, so this join
+    // is bounded.
+    reader.join();
+    QVERIFY2(returned_while_held, "tryGetTxStatus() waited for cs_main");
+    const auto [confirmed, unconfirmed]{read_result.get()};
+    QVERIFY(confirmed);
+    QCOMPARE(confirmed->depth_in_main_chain, confirmed_free->depth_in_main_chain);
+    QCOMPARE(confirmed->block_height, confirmed_free->block_height);
+    QVERIFY(unconfirmed);
+    QCOMPARE(unconfirmed->depth_in_main_chain, 0);
+    QVERIFY(!unconfirmed->is_in_main_chain);
+    QVERIFY(unconfirmed->is_trusted);
+}
+
 void TestGUI(interfaces::Node& node)
 {
     // Set up a small funded wallet history instead of importing the full mature chain.
@@ -5543,4 +5611,5 @@ void WalletTests::walletTests()
     TestExternalEncryptionModelDestroyed(m_node);
     TestExternalEncryptionRealWallet(m_node);
     TestEncryptWalletRpcWaitingForKeypoolTopUp(m_node);
+    TestTxStatusReadDoesNotWaitForCsMain(m_node);
 }

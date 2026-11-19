@@ -7,6 +7,7 @@ set(CMAKE_AUTOMOC_MOC_OPTIONS "-p${CMAKE_CURRENT_SOURCE_DIR}")
 add_executable(test_bitcoin-qt
   apptests.cpp
   clientmodeltests.cpp
+  guistallmonitortests.cpp
   modaloverlaytests.cpp
   optiontests.cpp
   pokertests.cpp
@@ -36,6 +37,7 @@ if(ENABLE_WALLET)
       psbtoperationsdialogtests.cpp
       quitmodaltests.cpp
       syntheticwallet.cpp
+      transactionfilterproxytests.cpp
       transactionrecordtests.cpp
       walletcontrollertests.cpp
       walletactivitytests.cpp

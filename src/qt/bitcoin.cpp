@@ -21,6 +21,7 @@
 #include <qt/bitcoingui.h>
 #include <qt/clientmodel.h>
 #include <qt/guiconstants.h>
+#include <qt/guistallmonitor.h>
 #include <qt/guiutil.h>
 #include <qt/initexecutor.h>
 #include <qt/intro.h>
@@ -440,6 +441,9 @@ void BitcoinApplication::initializeResult(bool success, interfaces::BlockAndHead
         // Log this only after AppInitMain finishes, as then logging setup is guaranteed complete
         qInfo() << "Platform customization:" << platformStyle->getName();
         clientModel = new ClientModel(node(), optionsModel);
+        // With -debug=qt, log when the event loop stalls. The monitor is owned
+        // by the client model, so it stops when the client model is deleted.
+        GuiStallMonitor::StartIfLogging(*clientModel);
         window->setClientModel(clientModel, &tip_info);
 
         // If '-min' option passed, start window minimized (iconified) or minimized to tray
