@@ -5505,7 +5505,10 @@ struct StatusRefreshHarness {
 
     void setClocks(WalletModel& wallet_model)
     {
-        wallet_model.setStatusRefreshClocksForTesting([] { return QDateTime::fromSecsSinceEpoch(NOW); }, [this] { return steady_now; });
+        wallet_model.setStatusRefreshClocksForTesting([] { return QDateTime::fromSecsSinceEpoch(NOW); }, [this] {
+            ++polls;
+            return steady_now;
+        });
     }
 
     //! Count full refreshes of the model's table, with the block the wallet
@@ -5553,6 +5556,8 @@ struct StatusRefreshHarness {
     std::unique_ptr<WalletModel> model;
     SteadyClock::time_point steady_now{SteadyClock::time_point{} + 1h};
     int height{0};
+    //! Polls of a model with these clocks: each reads the steady clock once.
+    int polls{0};
     int full_refreshes{0};
     std::vector<uint256> refreshed_wallet_blocks;
 };
@@ -5675,32 +5680,32 @@ void TestStatusRefreshWaitingPollsSkipWallet(interfaces::Node& node)
 {
     StatusRefreshHarness harness{node};
     WalletModel& model{*harness.model};
-    const auto balance_calls{[&] {
+    const auto balance_passes{[&] {
         std::lock_guard lock{harness.state->mutex};
-        return harness.state->try_get_balances_calls;
+        return harness.state->balance_passes;
     }};
 
     // A stale tip owes a refresh. Polls that only wait for it to be due do
     // not compute the wallet's balance; the poll it is due on does, once.
     harness.connectBlock(StatusRefreshHarness::STALE_TIP_TIME);
     model.pollBalanceChanged();
-    const int calls{balance_calls()};
-    QVERIFY(calls > 0);
+    const int passes{balance_passes()};
+    QVERIFY(passes > 0);
     for (int i{0}; i < 19; ++i) {
         harness.advance(MODEL_UPDATE_DELAY);
         model.pollBalanceChanged();
     }
     QCOMPARE(harness.full_refreshes, 0);
-    QCOMPARE(balance_calls(), calls);
+    QCOMPARE(balance_passes(), passes);
     harness.advance(MODEL_UPDATE_DELAY);
     model.pollBalanceChanged();
     QCOMPARE(harness.full_refreshes, 1);
-    QCOMPARE(balance_calls(), calls + 1);
+    QCOMPARE(balance_passes(), passes + 1);
     for (int i{0}; i < 10; ++i) {
         harness.advance(STALE_TIP_STATUS_REFRESH_QUIET);
         model.pollBalanceChanged();
     }
-    QCOMPARE(balance_calls(), calls + 1);
+    QCOMPARE(balance_passes(), passes + 1);
     QCOMPARE(harness.full_refreshes, 1);
 }
 
@@ -5836,6 +5841,22 @@ void TestStatusRefreshTipTimeBeforeNotification(interfaces::Node& node)
     QCOMPARE(*notified_tip.time, StatusRefreshHarness::FRESH_TIP_TIME);
 }
 
+void TestStatusRefreshModelDeletedByBalanceListener(interfaces::Node& node)
+{
+    StatusRefreshHarness harness{node};
+
+    // A balanceChanged listener can unload the wallet, as from a nested event
+    // loop, which deletes the model inside its own poll. On a fresh tip the
+    // refresh would be due right after the signal; the poll must not touch
+    // the deleted model.
+    WalletModel* const model{harness.model.get()};
+    QObject listener;
+    QObject::connect(model, &WalletModel::balanceChanged, &listener, [&harness] { harness.model.reset(); });
+    harness.connectBlock(StatusRefreshHarness::FRESH_TIP_TIME);
+    model->pollBalanceChanged();
+    QVERIFY(!harness.model);
+}
+
 void TestStatusRefreshPendingAtTeardown(interfaces::Node& node)
 {
     {
@@ -5850,15 +5871,19 @@ void TestStatusRefreshPendingAtTeardown(interfaces::Node& node)
         harness.advance(STALE_TIP_STATUS_REFRESH_QUIET);
         QVERIFY(WaitUntil([&] { return harness.full_refreshes == 1; }, 30000));
 
-        // Destroying the model with a refresh owed leaves nothing to run.
+        // Destroying the model with a refresh owed and the timer running
+        // leaves nothing behind that polls: the harness's clock, which
+        // outlives the model, is not read again while more than a poll
+        // interval passes.
         harness.connectBlock(StatusRefreshHarness::STALE_TIP_TIME);
         harness.model->pollBalanceChanged();
         QPointer<TransactionTableModel> table{harness.model->getTransactionTableModel()};
         harness.model.reset();
         QVERIFY(!table);
         harness.advance(STALE_TIP_STATUS_REFRESH_QUIET);
-        QCoreApplication::processEvents();
-        QCOMPARE(harness.full_refreshes, 1);
+        const int polls{harness.polls};
+        QTest::qWait(static_cast<int>(3 * count_milliseconds(MODEL_UPDATE_DELAY)));
+        QCOMPARE(harness.polls, polls);
     }
 
     // Detaching the client model with a refresh owed stops the timer and
@@ -5978,5 +6003,6 @@ void WalletTests::walletTests()
     TestStatusRefreshWhenTipBecomesFresh(m_node);
     TestStatusRefreshFreshTipIsImmediate(m_node);
     TestStatusRefreshTipTimeBeforeNotification(m_node);
+    TestStatusRefreshModelDeletedByBalanceListener(m_node);
     TestStatusRefreshPendingAtTeardown(m_node);
 }

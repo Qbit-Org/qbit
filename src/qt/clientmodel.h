@@ -80,7 +80,11 @@ public:
     //! The best block hash and the time of that same block, read together.
     struct BestBlock {
         uint256 hash;
-        //! Unset if the tip changed while it was read from the node.
+        //! Set by a block tip notification, or before the first one by
+        //! reading the node. Unset if the node's tip changed while it was
+        //! read, or if `hash` was cached earlier by getBestBlockHash() and
+        //! is no longer the node's tip, which can last until the next block
+        //! tip notification.
         std::optional<int64_t> time;
     };
     BestBlock getBestBlock() EXCLUSIVE_LOCKS_REQUIRED(!m_cached_tip_mutex);

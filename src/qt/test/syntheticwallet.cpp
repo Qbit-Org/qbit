@@ -721,8 +721,8 @@ public:
     {
         {
             std::lock_guard lock{m_state->mutex};
-            ++m_state->try_get_balances_calls;
             if (m_state->encrypt_in_progress) return false;
+            ++m_state->balance_passes;
             block_hash = m_state->last_block_hash;
         }
         balances = getBalances();

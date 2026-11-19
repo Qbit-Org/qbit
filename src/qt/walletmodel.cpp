@@ -188,10 +188,14 @@ void WalletModel::pollBalanceChanged()
         // Balance and number of transactions might have changed
         m_cached_last_update_tip = block_hash;
 
-        checkBalanceChanged(new_balances);
-
         // Transaction statuses might have changed too.
         if (!m_status_refresh_owed_since) m_status_refresh_owed_since = now;
+
+        // A balanceChanged listener may run a nested event loop that unloads
+        // the wallet and deletes this model, so check it after emitting.
+        QPointer<WalletModel> model{this};
+        checkBalanceChanged(new_balances);
+        if (!model) return;
     }
 
     if (statusRefreshDue(tip.hash, tip.time, now)) {

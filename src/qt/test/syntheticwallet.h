@@ -95,9 +95,9 @@ struct SyntheticWalletState {
     //! mutex, and the block tryGetBalances() reports the wallet has processed.
     std::atomic<CAmount> balance{50 * COIN};
     uint256 last_block_hash{};
-    //! Calls to tryGetBalances(), each a balance pass over the whole wallet
-    //! in the real one.
-    int try_get_balances_calls{0};
+    //! Calls to tryGetBalances() that got the wallet's locks, each a balance
+    //! pass over the whole wallet in the real one. Guarded by mutex.
+    int balance_passes{0};
     //! The address book, returned by getAddresses() and searched by
     //! getAddress(). Both wait on the encryption latch.
     std::vector<interfaces::WalletAddress> address_book;
