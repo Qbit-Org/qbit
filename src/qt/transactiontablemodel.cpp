@@ -432,9 +432,11 @@ void TransactionTableModel::updateAddressLabel(const QString &address)
     // wallet, so nothing reads a changed label again unless told to. Finding
     // the rows that show the address takes a pass over the whole history,
     // and notifying them makes every proxy filter and sort them again, which
-    // reads their status. Do neither inside the wallet's notification, which
-    // holds the wallet lock if the change was made on this thread, and make
-    // one pass for all the addresses changed until the event loop runs it.
+    // reads their status. Do neither inside the wallet's notification: for a
+    // change made on this thread, CWallet::DelAddressBook (inside a database
+    // transaction) and CWallet::GetNewDestination notify with cs_wallet held,
+    // so every other thread that needs the wallet would wait. Make one pass
+    // for all the addresses changed until the event loop runs it.
     m_changed_labels.insert(address.toStdString());
     queueLabelPass();
 }

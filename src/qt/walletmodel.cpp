@@ -223,12 +223,23 @@ void WalletModel::updateAddressBook(const QString &address, const QString &label
     // show this address, which it does once this call has returned.
     // Listeners may run nested event loops that delete this model, so check
     // it after each.
+    //
+    // The transaction list shows nothing of an entry but its label, so skip
+    // its pass over the history when the label stays as it was, as for the
+    // unlabelled receiving entry the wallet files for each address it finds
+    // used while it connects blocks or rescans, a change of purpose only, or
+    // the removal of an unlabelled entry. Before the constructor has created
+    // the models, which read the address book, there is nothing to update.
+    if (!m_complete_address_table_model) return;
     QPointer<WalletModel> model{this};
-    if (m_complete_address_table_model) m_complete_address_table_model->updateEntry(address, label, isMine, purpose, status);
+    const QString shown{m_complete_address_table_model->cachedLabelForAddress(address)};
+    m_complete_address_table_model->updateEntry(address, label, isMine, purpose, status);
     if (!model) return;
     if (addressTableModel && addressTableModel != m_complete_address_table_model) addressTableModel->updateEntry(address, label, isMine, purpose, status);
     if (!model) return;
-    if (transactionTableModel) transactionTableModel->updateAddressLabel(address);
+    if (transactionTableModel && m_complete_address_table_model->cachedLabelForAddress(address) != shown) {
+        transactionTableModel->updateAddressLabel(address);
+    }
 }
 
 void WalletModel::updateCanGetAddresses()

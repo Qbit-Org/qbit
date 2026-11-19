@@ -94,10 +94,12 @@ public:
         notified of the rows that show this address, in one signal for the
         address column from the first such row to the last. That happens in
         one pass for every address changed meanwhile, once control has
-        returned to the event loop: this is called from the wallet's
-        notification, which holds the wallet lock when the change was made
-        on this thread. Called by the wallet model once its address table
-        models have the update. */
+        returned to the event loop: this is called from inside the wallet's
+        notification, which for a change made on this thread can still hold
+        the wallet lock (CWallet::DelAddressBook and
+        CWallet::GetNewDestination notify with cs_wallet held, the deletion
+        inside a database transaction). Called by the wallet model once its
+        address table models have the update, if it changed the label. */
     void updateAddressLabel(const QString &address);
     /** Number of label passes over the rows so far, for tests. */
     uint64_t labelPassCount() const { return m_label_passes; }
