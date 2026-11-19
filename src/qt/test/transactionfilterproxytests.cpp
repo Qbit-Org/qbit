@@ -94,6 +94,7 @@ std::vector<Row> MakeRows()
     const std::vector<qint64> amounts{0, 1 * COIN, -1 * COIN, 5 * COIN, -7 * COIN, 1000 * COIN, -4999 * COIN, 3};
 
     std::vector<Row> rows;
+    rows.reserve(49);
     for (int i = 0; i < 49; ++i) {
         rows.push_back({
             .status = statuses.at(i % statuses.size()),
