@@ -17,6 +17,7 @@
 #include <wallet/coincontrol.h>
 #include <wallet/wallet.h>
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <set>
@@ -225,6 +226,23 @@ public:
         }
         if (returning) returning();
         return addresses;
+    }
+    bool tryGetAddresses(const std::vector<CTxDestination>& dests, std::vector<std::optional<interfaces::WalletAddress>>& entries) override
+    {
+        std::lock_guard lock{m_state->mutex};
+        ++m_state->try_get_addresses_calls;
+        if (m_state->encrypt_in_progress || m_state->WalletLockExcludesCaller()) return false;
+        entries.clear();
+        entries.reserve(dests.size());
+        for (const CTxDestination& dest : dests) {
+            const auto entry{std::find_if(m_state->address_book.begin(), m_state->address_book.end(), [&dest](const auto& e) { return e.dest == dest; })};
+            if (entry == m_state->address_book.end()) {
+                entries.emplace_back();
+            } else {
+                entries.emplace_back(*entry);
+            }
+        }
+        return true;
     }
     std::vector<OutputType> getAvailableAddressTypes() override { return {OutputType::P2MR}; }
     std::vector<std::string> getAddressReceiveRequests() override { return {}; }

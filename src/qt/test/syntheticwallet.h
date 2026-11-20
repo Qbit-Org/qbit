@@ -98,6 +98,8 @@ struct SyntheticWalletState {
     //! Number of getAddress() calls, counted before the call waits, with
     //! condition notified so a test can see the call.
     int get_address_calls{0};
+    //! Number of tryGetAddresses() calls, which give up instead of waiting.
+    int try_get_addresses_calls{0};
     //! Listener for the address book notification, so a test can raise it
     //! the way the wallet does after changing address_book.
     interfaces::Wallet::AddressBookChangedFn address_book_changed;

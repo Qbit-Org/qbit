@@ -303,6 +303,26 @@ public:
         });
         return result;
     }
+    bool tryGetAddresses(const std::vector<CTxDestination>& dests, std::vector<std::optional<WalletAddress>>& entries) override
+    {
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet) {
+            return false;
+        }
+        entries.clear();
+        entries.reserve(dests.size());
+        for (const CTxDestination& dest : dests) {
+            const CAddressBookData* entry{m_wallet->FindAddressBookEntry(dest, /*allow_change=*/false)};
+            if (!entry) {
+                entries.emplace_back();
+                continue;
+            }
+            const bool is_mine{m_wallet->IsMine(dest)};
+            // In very old wallets, address purpose may not be recorded so we derive it from IsMine
+            entries.emplace_back(std::in_place, dest, is_mine, entry->purpose.value_or(is_mine ? AddressPurpose::RECEIVE : AddressPurpose::SEND), entry->GetLabel());
+        }
+        return true;
+    }
     std::vector<OutputType> getAvailableAddressTypes() override
     {
         LOCK(m_wallet->cs_wallet);
