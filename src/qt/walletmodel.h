@@ -18,6 +18,7 @@
 #include <exception>
 #include <memory>
 #include <optional>
+#include <set>
 #include <vector>
 
 #include <QDateTime>
@@ -269,6 +270,12 @@ private:
     //! address. The address book pages and the transaction list keep it after
     //! refresh() has replaced addressTableModel.
     AddressTableModel* m_complete_address_table_model{nullptr};
+    //! Encoded addresses an address book notification reported, to compare
+    //! with the wallet in reconcileAddressBook().
+    std::set<QString> m_unreconciled_addresses;
+    bool m_address_book_reconcile_queued{false};
+    //! Runs reconcileAddressBook() again while the wallet lock is busy.
+    QTimer* m_address_book_retry_timer{nullptr};
     TransactionTableModel* transactionTableModel{nullptr};
     RecentRequestsTableModel* recentRequestsTableModel{nullptr};
 
@@ -282,6 +289,9 @@ private:
 
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
+    void applyAddressBookChange(const QString& address, const QString& label, bool isMine, wallet::AddressPurpose purpose, int status);
+    void queueAddressBookReconcile();
+    void reconcileAddressBook();
     void checkBalanceChanged(const interfaces::WalletBalances& new_balances);
 
 Q_SIGNALS:

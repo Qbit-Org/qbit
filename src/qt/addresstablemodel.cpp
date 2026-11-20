@@ -7,6 +7,7 @@
 #include <qt/guiutil.h>
 #include <qt/walletmodel.h>
 
+#include <interfaces/wallet.h>
 #include <key_io.h>
 #include <wallet/types.h>
 #include <wallet/wallet.h>
@@ -454,6 +455,15 @@ QString AddressTableModel::cachedLabelForAddress(const QString &address) const
     // or invalid string finds the entry the wallet would find.
     const AddressTableEntry* entry = priv->find(DecodeDestination(address.toStdString()));
     return entry ? entry->label : QString();
+}
+
+std::optional<int> AddressTableModel::changeToEntry(const QString &address, const interfaces::WalletAddress* entry) const
+{
+    const AddressTableEntry* row = priv->find(address);
+    if (!entry) return row ? std::optional<int>{CT_DELETED} : std::nullopt;
+    if (!row) return CT_NEW;
+    if (row->label == QString::fromStdString(entry->name) && row->type == translateTransactionType(entry->purpose, entry->is_mine)) return std::nullopt;
+    return CT_UPDATED;
 }
 
 std::optional<wallet::AddressPurpose> AddressTableModel::purposeForAddress(const QString &address) const
