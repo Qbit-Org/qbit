@@ -220,6 +220,7 @@ void WalletModel::updateAddressBook(const QString &address, const QString &label
     // Before the constructor has created the models, which read the address
     // book, there is nothing to update.
     if (!m_complete_address_table_model) return;
+    ++m_address_book_notifications;
     QPointer<WalletModel> model{this};
     applyAddressBookChange(address, label, isMine, purpose, status);
     if (!model) return;
@@ -273,11 +274,24 @@ void WalletModel::queueAddressBookReconcile()
 void WalletModel::reconcileAddressBook()
 {
     m_address_book_reconcile_queued = false;
-    if (m_unreconciled_addresses.empty()) return;
-    const std::vector<QString> addresses{m_unreconciled_addresses.begin(), m_unreconciled_addresses.end()};
+    // An entry the wallet holds under a destination its encoding does not
+    // name, such as one that encodes to the empty string, or an address this
+    // chain does not decode, cannot be looked up by that encoding: the read
+    // would find no entry and remove the row. Leave such a row as its
+    // notifications left it.
+    std::vector<QString> addresses;
     std::vector<CTxDestination> destinations;
-    destinations.reserve(addresses.size());
-    for (const QString& address : addresses) destinations.push_back(DecodeDestination(address.toStdString()));
+    for (auto it{m_unreconciled_addresses.begin()}; it != m_unreconciled_addresses.end();) {
+        CTxDestination destination{DecodeDestination(it->toStdString())};
+        if (!IsValidDestination(destination)) {
+            it = m_unreconciled_addresses.erase(it);
+            continue;
+        }
+        addresses.push_back(*it);
+        destinations.push_back(std::move(destination));
+        ++it;
+    }
+    if (addresses.empty()) return;
     // Never wait for the wallet lock on this thread. While it is busy, as
     // while the wallet connects a block or is being encrypted, keep the
     // addresses and try again later.
@@ -304,12 +318,21 @@ void WalletModel::reconcileAddressBook()
         const interfaces::WalletAddress* const entry{entries[i] ? &*entries[i] : nullptr};
         const std::optional<int> change{m_complete_address_table_model->changeToEntry(addresses[i], entry)};
         if (!change) continue;
+        const uint64_t notifications{m_address_book_notifications};
         if (entry) {
             applyAddressBookChange(addresses[i], QString::fromStdString(entry->name), entry->is_mine, entry->purpose, *change);
         } else {
             applyAddressBookChange(addresses[i], QString{}, /*isMine=*/false, wallet::AddressPurpose::SEND, *change);
         }
         if (!model) return;
+        // A listener may run a nested event loop that delivers a newer
+        // notification, which the entries read above for the addresses still
+        // to come may predate. Read those again instead of applying them.
+        if (m_address_book_notifications != notifications) {
+            for (size_t later = i + 1; later < addresses.size(); ++later) m_unreconciled_addresses.insert(addresses[later]);
+            queueAddressBookReconcile();
+            return;
+        }
     }
 }
 

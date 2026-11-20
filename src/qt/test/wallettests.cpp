@@ -5228,6 +5228,173 @@ void TestAddressBookReconcileKeepsLegacyOnlyModel(interfaces::Node& node)
     QCOMPARE(legacy_only->lookupAddress(alice_text), -1);
 }
 
+//! An entry the wallet holds under a destination its address string does
+//! not decode to, such as a public key, whose encoding is the empty string,
+//! cannot be looked up by that string: the wallet read would find no entry
+//! and the comparison would remove the row. The row stays as its
+//! notifications left it, and no read is made for it.
+void TestAddressBookReconcileSkipsUndecodableEntry(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination key{PubKeyDestination{GenerateRandomKey().GetPubKey()}};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0x61}}}};
+    QVERIFY(EncodeDestination(key).empty());
+    state->address_book.emplace_back(key, /*is_mine=*/false, wallet::AddressPurpose::SEND, "key");
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->wallet_tx = MakeSyntheticPayment({alice}, 18);
+    auto model{env.makeModel(state)};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    const auto key_row_label{[addresses] {
+        const int row{addresses->lookupAddress(QString{})};
+        return row < 0 ? QStringLiteral("(not listed)") : addresses->index(row, AddressTableModel::Label, {}).data(Qt::EditRole).toString();
+    }};
+    QCOMPARE(key_row_label(), QStringLiteral("key"));
+
+    const int reads_before{SyntheticWalletReads(*state)};
+    NotifyFromOtherThread(SyntheticAddressBookChange(state, key, "key2", wallet::AddressPurpose::SEND, CT_UPDATED));
+    QCOMPARE(key_row_label(), QStringLiteral("key2"));
+    QCOMPARE(addresses->rowCount({}), 2);
+    QCOMPARE(SyntheticWalletReads(*state) - reads_before, 0);
+}
+
+//! The comparison with the wallet reads every recorded entry, then applies
+//! the differences one by one. If a listener of one row runs a nested event
+//! loop that delivers a newer notification for an address still to come,
+//! the entry read for that address is older than the notification, so it is
+//! read again instead of applied.
+void TestAddressBookReconcileRereadsAfterNestedNotification(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    // The comparison goes through the addresses in the order of their
+    // encodings, so name them by it.
+    std::array<CTxDestination, 2> dests{CTxDestination{WitnessV2P2MR{uint256{uint8_t{0x62}}}}, CTxDestination{WitnessV2P2MR{uint256{uint8_t{0x63}}}}};
+    if (EncodeDestination(dests[1]) < EncodeDestination(dests[0])) std::swap(dests[0], dests[1]);
+    const CTxDestination& first{dests[0]};
+    const CTxDestination& second{dests[1]};
+    const QString first_text{QString::fromStdString(EncodeDestination(first))};
+    const QString second_text{QString::fromStdString(EncodeDestination(second))};
+    state->address_book.emplace_back(first, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "f0");
+    state->address_book.emplace_back(second, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "s0");
+    state->wallet_tx = MakeSyntheticPayment({first, second}, 19);
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+
+    // Both entries were written twice and the notifications arrive the other
+    // way round, so the comparison has to correct both.
+    SetSyntheticAddressBookEntry(state, first, "f2", wallet::AddressPurpose::RECEIVE);
+    SetSyntheticAddressBookEntry(state, second, "s2", wallet::AddressPurpose::RECEIVE);
+    std::thread{[&] {
+        for (const auto& [dest, label] : {std::pair{first, "f2"}, std::pair{first, "f1"}, std::pair{second, "s2"}, std::pair{second, "s1"}}) {
+            SyntheticLateAddressBookNotification(state, dest, label, wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+        }
+    }}.join();
+    QCoreApplication::sendPostedEvents();
+    QCOMPARE(addresses->cachedLabelForAddress(first_text), QStringLiteral("f1"));
+    QCOMPARE(addresses->cachedLabelForAddress(second_text), QStringLiteral("s1"));
+
+    // While the comparison corrects the first, a listener runs a nested event
+    // loop in which the second is relabelled again, as from the GUI, and
+    // that notification is applied and compared with the wallet.
+    bool nested{false};
+    QObject::connect(addresses, &QAbstractItemModel::dataChanged, addresses, [&](const QModelIndex& top) {
+        if (nested || addresses->index(top.row(), AddressTableModel::Address, {}).data(Qt::EditRole).toString() != first_text) return;
+        nested = true;
+        SyntheticAddressBookChange(state, second, "s3", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+        QCoreApplication::sendPostedEvents();
+    });
+    DeliverPostedEvents();
+    QVERIFY(nested);
+    QCOMPARE(addresses->cachedLabelForAddress(first_text), QStringLiteral("f2"));
+    QCOMPARE(addresses->cachedLabelForAddress(second_text), QStringLiteral("s3"));
+    QCOMPARE(TransactionLabel(*table, 0), QStringLiteral("f2"));
+    QCOMPARE(TransactionLabel(*table, 1), QStringLiteral("s3"));
+}
+
+//! While the message signing dialog's legacy-only model is the current one,
+//! the comparison with the wallet changes both models as the notifications
+//! would have, had they arrived in the order of the writes: a legacy entry
+//! relabelled (CT_UPDATED for a row both models list), a non-legacy entry
+//! removed and added again (CT_NEW) and a legacy entry added and removed
+//! again (CT_DELETED).
+void TestAddressBookReconcileWithLegacyOnlyModel(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    const CTxDestination lee{PKHash{uint160{std::vector<unsigned char>(20, 0x71)}}};
+    const CTxDestination lou{PKHash{uint160{std::vector<unsigned char>(20, 0x72)}}};
+    const CTxDestination nina{WitnessV2P2MR{uint256{uint8_t{0x73}}}};
+    struct Write {
+        CTxDestination dest;
+        std::string label;
+        ChangeType status;
+    };
+    struct Scenario {
+        const char* name;
+        std::vector<Write> writes;
+    };
+    const std::array<Scenario, 3> scenarios{{
+        {"legacy relabelled", {{lee, "lee1", CT_UPDATED}, {lee, "lee2", CT_UPDATED}}},
+        {"non-legacy removed and added again", {{nina, "", CT_DELETED}, {nina, "nina2", CT_NEW}}},
+        {"legacy added and removed again", {{lou, "lou", CT_NEW}, {lou, "", CT_DELETED}}},
+    }};
+    // The rows of a model, as address and label.
+    const auto rows{[](const AddressTableModel& table) {
+        std::vector<std::pair<QString, QString>> rows;
+        for (int row = 0; row < table.rowCount({}); ++row) {
+            rows.emplace_back(table.index(row, AddressTableModel::Address, {}).data(Qt::EditRole).toString(),
+                              table.index(row, AddressTableModel::Label, {}).data(Qt::EditRole).toString());
+        }
+        return rows;
+    }};
+    const auto encode{[](const CTxDestination& dest) { return QString::fromStdString(EncodeDestination(dest)); }};
+    const auto row{[&encode](const CTxDestination& dest, const char* label) { return std::pair{encode(dest), QString::fromUtf8(label)}; }};
+    const std::array<std::vector<std::pair<QString, QString>>, 3> legacy_expected{{
+        {row(lee, "lee2")},
+        {row(lee, "lee"), row(nina, "nina2")},
+        {row(lee, "lee")},
+    }};
+    for (size_t i = 0; i < scenarios.size(); ++i) {
+        const Scenario& scenario{scenarios[i]};
+        std::array<std::vector<std::pair<QString, QString>>, 2> complete_rows;
+        std::array<std::vector<std::pair<QString, QString>>, 2> legacy_rows;
+        for (const bool reordered : {false, true}) {
+            auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+            state->address_book.emplace_back(lee, /*is_mine=*/false, wallet::AddressPurpose::SEND, "lee");
+            state->address_book.emplace_back(nina, /*is_mine=*/false, wallet::AddressPurpose::SEND, "nina");
+            state->wallet_tx = MakeSyntheticPayment({lee, lou, nina}, 20);
+            auto model{env.makeModel(state)};
+            AddressTableModel* const complete{model->getAddressTableModel()};
+            model->refresh(/*pk_hash_only=*/true);
+            AddressTableModel* const legacy_only{model->getAddressTableModel()};
+            QCOMPARE(legacy_only->rowCount({}), 1);
+            // The wallet holds the result of the writes; the notifications
+            // arrive in their order or the other way round.
+            for (const Write& write : scenario.writes) {
+                SetSyntheticAddressBookEntry(state, write.dest, write.status == CT_DELETED ? std::nullopt : std::optional{write.label}, wallet::AddressPurpose::SEND);
+            }
+            std::vector<Write> arrivals{scenario.writes};
+            if (reordered) std::reverse(arrivals.begin(), arrivals.end());
+            NotifyFromOtherThread([&] {
+                for (const Write& write : arrivals) SyntheticLateAddressBookNotification(state, write.dest, write.label, wallet::AddressPurpose::SEND, write.status)();
+            });
+            complete_rows[reordered] = rows(*complete);
+            legacy_rows[reordered] = rows(*legacy_only);
+        }
+        QVERIFY2(complete_rows[0] == complete_rows[1], scenario.name);
+        QVERIFY2(legacy_rows[0] == legacy_rows[1], scenario.name);
+        // The legacy-only model lists the relabelled legacy entry, the
+        // non-legacy entry a CT_NEW gives it as a notification would, and
+        // not the removed one.
+        std::vector<std::pair<QString, QString>> expected{legacy_expected[i]};
+        std::sort(expected.begin(), expected.end());
+        std::vector<std::pair<QString, QString>> shown{legacy_rows[1]};
+        std::sort(shown.begin(), shown.end());
+        QVERIFY2(shown == expected, scenario.name);
+    }
+}
+
 //! Compare the label of each address in the address table model the
 //! transaction list reads, and of each transaction row, with the one the
 //! wallet gives.
@@ -7003,6 +7170,9 @@ void WalletTests::walletTests()
     TestAddressBookReconcileInOrderChangesNothing(m_node);
     TestModelDeletedWithAddressBookReconcilePending(m_node);
     TestAddressBookReconcileKeepsLegacyOnlyModel(m_node);
+    TestAddressBookReconcileSkipsUndecodableEntry(m_node);
+    TestAddressBookReconcileRereadsAfterNestedNotification(m_node);
+    TestAddressBookReconcileWithLegacyOnlyModel(m_node);
     TestTransactionLabelsMatchWallet(m_node);
     TestAddressBookChangesWhileModelLoads(m_node);
     TestEncryptWalletOtherWalletStatusChange(m_node);

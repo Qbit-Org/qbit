@@ -274,6 +274,9 @@ private:
     //! with the wallet in reconcileAddressBook().
     std::set<QString> m_unreconciled_addresses;
     bool m_address_book_reconcile_queued{false};
+    //! Counts the address book notifications applied, so reconcileAddressBook()
+    //! can tell that a listener delivered one while it applied an entry.
+    uint64_t m_address_book_notifications{0};
     //! Runs reconcileAddressBook() again while the wallet lock is busy.
     QTimer* m_address_book_retry_timer{nullptr};
     TransactionTableModel* transactionTableModel{nullptr};
