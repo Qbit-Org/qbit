@@ -32,6 +32,7 @@
 #include <qt/signverifymessagedialog.h>
 #include <qt/test/syntheticwallet.h>
 #include <qt/transactionrecord.h>
+#include <qt/transactionfilterproxy.h>
 #include <qt/transactiontablemodel.h>
 #include <qt/transactionview.h>
 #include <qt/walletmodel.h>
@@ -51,12 +52,15 @@
 #include <consensus/consensus.h>
 #include <test/util/setup_common.h>
 #include <util/check.h>
+#include <util/strencodings.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <wallet/pqc_usage.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -95,6 +99,7 @@
 #include <QProgressDialog>
 #include <QPushButton>
 #include <QSignalSpy>
+#include <QTableView>
 #include <QTabWidget>
 #include <QTimer>
 #include <QTranslator>
@@ -4135,6 +4140,1628 @@ void TestEncryptWalletRepaintUsesCachedLabels(interfaces::Node& node)
     }, 5000));
 }
 
+//! A payment from elsewhere to the given addresses of the wallet, one output
+//! each, which the transaction list shows as one row per output in output
+//! order. prevout_n makes the transaction id distinct.
+interfaces::WalletTx MakeSyntheticPayment(const std::vector<CTxDestination>& destinations, uint32_t prevout_n)
+{
+    CMutableTransaction mtx;
+    mtx.vin.emplace_back(COutPoint{Txid{}, prevout_n});
+    for (const CTxDestination& dest : destinations) mtx.vout.emplace_back(COIN, GetScriptForDestination(dest));
+    return interfaces::WalletTx{
+        .tx = MakeTransactionRef(mtx),
+        .txin_is_mine = {false},
+        .txout_is_mine = std::vector<bool>(destinations.size(), true),
+        .txout_is_change = std::vector<bool>(destinations.size(), false),
+        .txout_address = destinations,
+        .txout_address_is_mine = std::vector<bool>(destinations.size(), true),
+        .credit = static_cast<CAmount>(destinations.size()) * COIN,
+        .debit = 0,
+        .change = 0,
+        .time = 1,
+        .value_map = {},
+        .is_coinbase = false,
+    };
+}
+
+//! Change the synthetic wallet's address book and raise its notification, as
+//! CWallet::SetAddressBook and DelAddressBook do. Run it on the GUI thread
+//! for a change the GUI makes, which the wallet model receives at once, or
+//! on another thread for one an RPC makes, which it receives queued.
+std::function<void()> SyntheticAddressBookChange(const std::shared_ptr<qt_test::SyntheticWalletState>& state,
+                                                 const CTxDestination& dest, const std::string& label,
+                                                 wallet::AddressPurpose purpose, ChangeType status)
+{
+    return [state, dest, label, purpose, status] {
+        const bool is_mine{purpose == wallet::AddressPurpose::RECEIVE};
+        interfaces::Wallet::AddressBookChangedFn notify;
+        {
+            std::lock_guard lock{state->mutex};
+            auto& book{state->address_book};
+            const auto entry{std::find_if(book.begin(), book.end(), [&dest](const auto& e) { return e.dest == dest; })};
+            if (status == CT_DELETED) {
+                if (entry != book.end()) book.erase(entry);
+            } else if (entry == book.end()) {
+                book.emplace_back(dest, is_mine, purpose, label);
+            } else {
+                entry->name = label;
+                entry->purpose = purpose;
+            }
+            notify = state->address_book_changed;
+        }
+        if (notify) notify(dest, label, is_mine, purpose, status);
+    };
+}
+
+//! Make a transaction the synthetic wallet's own and raise its notification,
+//! as the wallet does when it adds or updates a transaction.
+std::function<void()> SyntheticTransactionChange(const std::shared_ptr<qt_test::SyntheticWalletState>& state,
+                                                 const interfaces::WalletTx& wtx, ChangeType status)
+{
+    return [state, wtx, status] {
+        std::vector<interfaces::Wallet::TransactionChangedFn> notify;
+        {
+            std::lock_guard lock{state->mutex};
+            state->wallet_tx = wtx;
+            for (const auto& [id, fn] : state->transaction_changed) notify.push_back(fn);
+        }
+        for (const auto& fn : notify) fn(wtx.tx->GetHash(), status);
+    };
+}
+
+//! Deliver the posted events as the event loop does, and then what they
+//! post in turn: address book notifications queue the transaction table's
+//! label pass and the wallet model's comparison with the wallet, and a
+//! correction that comparison makes queues another label pass.
+void DeliverPostedEvents()
+{
+    for (int round = 0; round < 3; ++round) QCoreApplication::sendPostedEvents();
+}
+
+//! Raise wallet notifications from another thread, as the wallet does when an
+//! RPC or a connected block changes it, so the models receive them queued,
+//! then deliver them as the event loop does. The notifications only post
+//! events, so the thread cannot wait on the GUI thread, and everything they
+//! posted is queued once it has ended.
+void NotifyFromOtherThread(const std::function<void()>& notify)
+{
+    std::thread thread{notify};
+    thread.join();
+    DeliverPostedEvents();
+}
+
+//! Set the synthetic wallet's address book entry for dest, or remove it if
+//! label is std::nullopt, without a notification: what a writer leaves in
+//! the wallet before it notifies.
+void SetSyntheticAddressBookEntry(const std::shared_ptr<qt_test::SyntheticWalletState>& state, const CTxDestination& dest,
+                                  const std::optional<std::string>& label, wallet::AddressPurpose purpose)
+{
+    std::lock_guard lock{state->mutex};
+    auto& book{state->address_book};
+    const auto entry{std::find_if(book.begin(), book.end(), [&dest](const auto& e) { return e.dest == dest; })};
+    if (!label) {
+        if (entry != book.end()) book.erase(entry);
+    } else if (entry == book.end()) {
+        book.emplace_back(dest, /*is_mine=*/purpose == wallet::AddressPurpose::RECEIVE, purpose, *label);
+    } else {
+        entry->name = *label;
+        entry->purpose = purpose;
+    }
+}
+
+//! Number of tryGetAddresses() calls the synthetic wallet has had.
+int SyntheticWalletReads(qt_test::SyntheticWalletState& state)
+{
+    std::lock_guard lock{state.mutex};
+    return state.try_get_addresses_calls;
+}
+
+//! Raise an address book notification without changing the synthetic
+//! wallet's address book, as a writer does whose notification comes after
+//! another writer has changed the same entry again.
+std::function<void()> SyntheticLateAddressBookNotification(const std::shared_ptr<qt_test::SyntheticWalletState>& state,
+                                                           const CTxDestination& dest, const std::string& label,
+                                                           wallet::AddressPurpose purpose, ChangeType status)
+{
+    return [state, dest, label, purpose, status] {
+        interfaces::Wallet::AddressBookChangedFn notify;
+        {
+            std::lock_guard lock{state->mutex};
+            notify = state->address_book_changed;
+        }
+        if (notify) notify(dest, label, /*is_mine=*/purpose == wallet::AddressPurpose::RECEIVE, purpose, status);
+    };
+}
+
+//! The rows the transaction table's dataChanged() signals in changed covered,
+//! with -1 if one covered more than the address column, the only column that
+//! shows the label.
+std::set<int> NotifiedLabelRows(const QSignalSpy& changed)
+{
+    std::set<int> rows;
+    for (const QList<QVariant>& args : changed) {
+        const QModelIndex top{args.at(0).value<QModelIndex>()};
+        const QModelIndex bottom{args.at(1).value<QModelIndex>()};
+        if (top.column() != TransactionTableModel::ToAddress || bottom.column() != TransactionTableModel::ToAddress) rows.insert(-1);
+        for (int row = top.row(); row <= bottom.row(); ++row) rows.insert(row);
+    }
+    return rows;
+}
+
+//! Run a function when leaving the scope. Declared after a JoinOnExit, it
+//! releases the helper thread when a failed check returns early, so the
+//! join does not wait for the thread's bound.
+struct RunOnExit {
+    std::function<void()> run;
+
+    ~RunOnExit() { run(); }
+};
+
+QString TransactionLabel(const TransactionTableModel& table, int row)
+{
+    return table.index(row, TransactionTableModel::ToAddress).data(TransactionTableModel::LabelRole).toString();
+}
+
+//! Transaction rows show labels from the address table model's rows. Reading
+//! the label roles, painting the list, filtering it by label and sorting it
+//! by the label column never ask the wallet, which makes each such read wait
+//! whenever another thread holds the wallet lock, as the wallet does for each
+//! block it connects (#445).
+void TestTransactionLabelsSkipWalletLock(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination alice{PKHash{*uint160::FromHex("0000000000000000000000000000000000000011")}};
+    const CTxDestination bob{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000012")}};
+    const CTxDestination blank{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000013")}};
+    const CTxDestination unknown{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000014")}};
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->address_book.emplace_back(bob, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "bob");
+    state->address_book.emplace_back(blank, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "");
+    state->wallet_tx = MakeSyntheticPayment({alice, bob, blank, unknown}, 1);
+    state->wallet_tx_status.block_height = 1;
+    state->wallet_tx_status.depth_in_main_chain = 1;
+    state->wallet_tx_status.is_trusted = true;
+    state->wallet_tx_status.is_in_main_chain = true;
+
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    TransactionView view{env.platform_style.get()};
+    view.setModel(model.get());
+    view.resize(1000, 600);
+    TransactionFilterProxy* const proxy{view.findChild<TransactionFilterProxy*>()};
+    QTableView* const list{view.findChild<QTableView*>()};
+    QVERIFY(proxy);
+    QVERIFY(list);
+    QCOMPARE(table->rowCount({}), 4);
+    QCOMPARE(proxy->rowCount({}), 4);
+
+    // Another thread takes the wallet lock and holds it until the GUI thread
+    // is done. It lets go as soon as the GUI thread asks the wallet for an
+    // address, a call that waits for the lock, so that the test fails at once
+    // rather than hanging; the bound only ends a GUI thread that never
+    // finishes, and no pause of the process can fail the test.
+    int calls_before{0};
+    {
+        std::lock_guard lock{state->mutex};
+        state->wallet_lock_held = true;
+        calls_before = state->get_address_calls;
+    }
+    bool gui_done{false};
+    bool held_throughout{false};
+    std::thread holder{[state, &gui_done, &held_throughout, calls_before] {
+        std::unique_lock lock{state->mutex};
+        const bool woken{state->condition.wait_for(lock, std::chrono::seconds{60}, [&] {
+            return gui_done || state->get_address_calls != calls_before;
+        })};
+        held_throughout = woken && state->get_address_calls == calls_before;
+        state->wallet_lock_held = false;
+        lock.unlock();
+        state->condition.notify_all();
+    }};
+    const auto finish{[&state, &gui_done] {
+        {
+            std::lock_guard lock{state->mutex};
+            gui_done = true;
+        }
+        state->condition.notify_all();
+    }};
+    const JoinOnExit join_holder{holder};
+    const RunOnExit finish_on_exit{finish};
+
+    // What a repaint, a tooltip, a copy and an export of each row ask for.
+    const std::array<QString, 4> labels{QStringLiteral("alice"), QStringLiteral("bob"), QString{}, QString{}};
+    for (int row = 0; row < 4; ++row) {
+        const QModelIndex index{table->index(row, TransactionTableModel::ToAddress)};
+        const QString address{index.data(TransactionTableModel::AddressRole).toString()};
+        QCOMPARE(index.data(TransactionTableModel::LabelRole).toString(), labels[row]);
+        QCOMPARE(index.data(Qt::EditRole).toString(), QStringLiteral("%1 (%2)").arg(labels[row], address));
+        QVERIFY(index.data(Qt::ToolTipRole).toString().endsWith(QStringLiteral("%1 (%2)").arg(labels[row], address)));
+        QCOMPARE(index.data(Qt::ForegroundRole).isValid(), labels[row].isEmpty());
+        QVERIFY(index.data(TransactionTableModel::TxPlainTextRole).toString().contains(address));
+    }
+    view.grab();
+    proxy->setSearchString(QStringLiteral("alice"));
+    QCOMPARE(proxy->rowCount({}), 1);
+    QCOMPARE(proxy->index(0, 0).data(TransactionTableModel::LabelRole).toString(), QStringLiteral("alice"));
+    proxy->setSearchString(QStringLiteral("BOB"));
+    QCOMPARE(proxy->rowCount({}), 1);
+    proxy->setSearchString(QString{});
+    QCOMPARE(proxy->rowCount({}), 4);
+    // Sorting by the label column orders the unlabelled rows, shown as
+    // " (address)", before the labelled ones.
+    list->sortByColumn(TransactionTableModel::ToAddress, Qt::AscendingOrder);
+    QCOMPARE(proxy->index(2, 0).data(TransactionTableModel::LabelRole).toString(), QStringLiteral("alice"));
+    QCOMPARE(proxy->index(3, 0).data(TransactionTableModel::LabelRole).toString(), QStringLiteral("bob"));
+    view.grab();
+    finish();
+    holder.join();
+    QVERIFY2(held_throughout, "GUI thread asked the wallet for a label while another thread held the wallet lock");
+}
+
+//! What one order of delivering a payment and its label left behind.
+struct LabelDeliveryOutcome {
+    int table_rows{0};
+    int shown_rows{0};
+    QString label;
+    int address_rows{0};
+
+    bool operator==(const LabelDeliveryOutcome&) const = default;
+};
+
+//! Deliver a payment to a new address and the label for that address in the
+//! given order, then again, while the transaction list searches for the
+//! label.
+void DeliverPaymentAndLabel(SyntheticModelEnvironment& env, bool label_first, LabelDeliveryOutcome& outcome)
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    TransactionView view{env.platform_style.get()};
+    view.setModel(model.get());
+    TransactionFilterProxy* const proxy{view.findChild<TransactionFilterProxy*>()};
+    QVERIFY(proxy);
+    proxy->setSearchString(QStringLiteral("carol"));
+    QCOMPARE(table->rowCount({}), 0);
+
+    const CTxDestination carol{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000021")}};
+    const auto payment{SyntheticTransactionChange(state, MakeSyntheticPayment({carol}, 2), CT_NEW)};
+    const auto label{SyntheticAddressBookChange(state, carol, "carol", wallet::AddressPurpose::RECEIVE, CT_NEW)};
+    if (label_first) {
+        NotifyFromOtherThread(label);
+        QCOMPARE(addresses->rowCount({}), 1);
+        QCOMPARE(table->rowCount({}), 0);
+        NotifyFromOtherThread(payment);
+        QCOMPARE(table->rowCount({}), 1);
+    } else {
+        // The payment arrives first, as when an RPC sends it and then sets
+        // the label: the search hides the row while its label is unknown.
+        NotifyFromOtherThread(payment);
+        QCOMPARE(table->rowCount({}), 1);
+        QCOMPARE(proxy->rowCount({}), 0);
+        NotifyFromOtherThread(label);
+        QCOMPARE(addresses->rowCount({}), 1);
+    }
+    // Shown once both, and the label pass they queue, have been delivered.
+    QCOMPARE(proxy->rowCount({}), 1);
+
+    // Repeated and updating notifications change nothing.
+    NotifyFromOtherThread([&] {
+        label();
+        payment();
+        SyntheticAddressBookChange(state, carol, "carol", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+        SyntheticTransactionChange(state, MakeSyntheticPayment({carol}, 2), CT_UPDATED)();
+    });
+    outcome = {
+        .table_rows = table->rowCount({}),
+        .shown_rows = proxy->rowCount({}),
+        .label = TransactionLabel(*table, 0),
+        .address_rows = addresses->rowCount({}),
+    };
+}
+
+//! A payment and the label for its address reach the GUI as separate queued
+//! notifications, in either order. Rows show the label from the address
+//! table model, so a label update invalidates the rows that show the
+//! address: a search for the label finds the row whichever arrives first,
+//! and repeated notifications leave a single row.
+void TestTransactionLabelDeliveryOrder(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    LabelDeliveryOutcome payment_first;
+    DeliverPaymentAndLabel(env, /*label_first=*/false, payment_first);
+    if (QTest::currentTestFailed()) return;
+    LabelDeliveryOutcome label_first;
+    DeliverPaymentAndLabel(env, /*label_first=*/true, label_first);
+    if (QTest::currentTestFailed()) return;
+    QVERIFY(payment_first == label_first);
+    QCOMPARE(payment_first.table_rows, 1);
+    QCOMPARE(payment_first.shown_rows, 1);
+    QCOMPARE(payment_first.label, QStringLiteral("carol"));
+    QCOMPARE(payment_first.address_rows, 1);
+}
+
+//! Editing or removing a label while the transaction list is shown updates
+//! the rows that show that address. They are notified in one signal for the
+//! address column, from the first row that shows the address to the last.
+void TestLabelChangeUpdatesItsRows(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination alice{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000031")}};
+    const CTxDestination bob{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000032")}};
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->address_book.emplace_back(bob, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "bob");
+    // Rows 0 and 2 show alice, row 1 shows bob.
+    state->wallet_tx = MakeSyntheticPayment({alice, bob, alice}, 3);
+
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    TransactionView view{env.platform_style.get()};
+    view.setModel(model.get());
+    view.resize(1000, 600);
+    view.show();
+    TransactionFilterProxy* const proxy{view.findChild<TransactionFilterProxy*>()};
+    QVERIFY(proxy);
+    proxy->setSearchString(QStringLiteral("carol"));
+    QCOMPARE(table->rowCount({}), 3);
+    QCOMPARE(proxy->rowCount({}), 0);
+
+    QSignalSpy changed{table, &QAbstractItemModel::dataChanged};
+    QVERIFY(changed.isValid());
+
+    // Rename alice from the GUI, as the address book page does: the wallet
+    // notifies the model at once, and its rows once the event loop runs.
+    SyntheticAddressBookChange(state, alice, "carol", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+    QCoreApplication::sendPostedEvents();
+    QCOMPARE(changed.size(), 1);
+    QCOMPARE(NotifiedLabelRows(changed), (std::set<int>{0, 1, 2}));
+    QCOMPARE(TransactionLabel(*table, 0), QStringLiteral("carol"));
+    QCOMPARE(TransactionLabel(*table, 1), QStringLiteral("bob"));
+    QCOMPARE(TransactionLabel(*table, 2), QStringLiteral("carol"));
+    QCOMPARE(proxy->rowCount({}), 2);
+    view.grab();
+
+    // Remove it.
+    changed.clear();
+    SyntheticAddressBookChange(state, alice, "", wallet::AddressPurpose::RECEIVE, CT_DELETED)();
+    QCoreApplication::sendPostedEvents();
+    QCOMPARE(changed.size(), 1);
+    QCOMPARE(NotifiedLabelRows(changed), (std::set<int>{0, 1, 2}));
+    QCOMPARE(TransactionLabel(*table, 0), QString{});
+    QCOMPARE(TransactionLabel(*table, 1), QStringLiteral("bob"));
+    QCOMPARE(TransactionLabel(*table, 2), QString{});
+    QCOMPARE(proxy->rowCount({}), 0);
+
+    // Relabel bob from another thread, as the setlabel RPC does.
+    changed.clear();
+    NotifyFromOtherThread(SyntheticAddressBookChange(state, bob, "carol", wallet::AddressPurpose::RECEIVE, CT_UPDATED));
+    QCOMPARE(changed.size(), 1);
+    QCOMPARE(NotifiedLabelRows(changed), (std::set<int>{1}));
+    QCOMPARE(TransactionLabel(*table, 1), QStringLiteral("carol"));
+    QCOMPARE(proxy->rowCount({}), 1);
+    view.grab();
+}
+
+//! A label removed on the GUI thread, as the address book page removes a
+//! sending address, reaches the wallet model inside the wallet's
+//! notification, which CWallet::DelAddressBook raises with cs_wallet held
+//! inside a database transaction; CWallet::GetNewDestination also notifies
+//! with it held, while CWallet::SetAddressBookWithDB notifies after
+//! releasing it. The address table models take the change at once. The
+//! transaction rows are notified only once that call has returned, so the
+//! proxies' filtering and sorting, which read transaction statuses, never
+//! run under the wallet lock while every other thread waits for it.
+void TestLabelChangeWaitsForWalletNotification(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const auto p2mr{[](uint8_t n) { return CTxDestination{WitnessV2P2MR{uint256{n}}}; }};
+    const CTxDestination alice{p2mr(0x41)};
+    const CTxDestination bob{p2mr(0x42)};
+    state->address_book.emplace_back(alice, /*is_mine=*/false, wallet::AddressPurpose::SEND, "alice");
+    state->address_book.emplace_back(bob, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "bob");
+    state->wallet_tx = MakeSyntheticPayment({alice, bob, alice}, 4);
+
+    std::set<int> notified;
+    bool notified_under_lock{false};
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    TransactionView view{env.platform_style.get()};
+    view.setModel(model.get());
+    TransactionFilterProxy* const proxy{view.findChild<TransactionFilterProxy*>()};
+    QVERIFY(proxy);
+    proxy->setSearchString(QStringLiteral("alice"));
+    QCOMPARE(proxy->rowCount({}), 2);
+    QObject::connect(table, &QAbstractItemModel::dataChanged, table, [&](const QModelIndex& top, const QModelIndex& bottom) {
+        {
+            std::lock_guard lock{state->mutex};
+            notified_under_lock = notified_under_lock || state->wallet_lock_held;
+        }
+        for (int row = top.row(); row <= bottom.row(); ++row) notified.insert(row);
+    });
+
+    // Remove alice on the GUI thread while it holds the wallet lock, as
+    // CWallet::DelAddressBook does while it notifies.
+    const auto hold_wallet_lock{[&state](bool held) {
+        {
+            std::lock_guard lock{state->mutex};
+            state->wallet_lock_held = held;
+            state->wallet_lock_owner = held ? std::this_thread::get_id() : std::thread::id{};
+        }
+        state->condition.notify_all();
+    }};
+    hold_wallet_lock(true);
+    SyntheticAddressBookChange(state, alice, "", wallet::AddressPurpose::SEND, CT_DELETED)();
+    const bool notified_before_return{!notified.empty()};
+    hold_wallet_lock(false);
+    QVERIFY2(!notified_before_return, "transaction rows were notified inside the wallet's notification");
+    QCOMPARE(addresses->lookupAddress(QString::fromStdString(EncodeDestination(alice))), -1);
+    QCOMPARE(TransactionLabel(*table, 0), QString{});
+
+    QCoreApplication::sendPostedEvents();
+    QVERIFY(!notified_under_lock);
+    QCOMPARE(notified, (std::set<int>{0, 1, 2}));
+    QCOMPARE(proxy->rowCount({}), 0);
+}
+
+//! The transaction list shows nothing of an address book entry but its
+//! label, so a change that leaves the label as it was queues no pass over
+//! the history, such as the unlabelled receiving entry the wallet files for
+//! each address it finds used while it connects blocks or rescans. A label
+//! added, changed or removed still queues one.
+void TestLabelPassOnlyForLabelChanges(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0xb1}}}};
+    const CTxDestination bob{WitnessV2P2MR{uint256{uint8_t{0xb2}}}};
+    const CTxDestination carol{WitnessV2P2MR{uint256{uint8_t{0xb3}}}};
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->address_book.emplace_back(bob, /*is_mine=*/false, wallet::AddressPurpose::SEND, "");
+    state->wallet_tx = MakeSyntheticPayment({alice, bob, carol}, 11);
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    const auto passes{[table](const std::function<void()>& change) {
+        const uint64_t before{table->labelPassCount()};
+        NotifyFromOtherThread(change);
+        return table->labelPassCount() - before;
+    }};
+    const auto change{[&state](const CTxDestination& dest, const std::string& label, wallet::AddressPurpose purpose, ChangeType status) {
+        return SyntheticAddressBookChange(state, dest, label, purpose, status);
+    }};
+
+    // A new entry with an empty label, as for a newly used address.
+    QCOMPARE(passes(change(carol, "", wallet::AddressPurpose::RECEIVE, CT_NEW)), uint64_t{0});
+    QCOMPARE(addresses->rowCount({}), 3);
+    // A change of purpose only.
+    QCOMPARE(passes(change(alice, "alice", wallet::AddressPurpose::SEND, CT_UPDATED)), uint64_t{0});
+    // The removal of an unlabelled entry.
+    QCOMPARE(passes(change(bob, "", wallet::AddressPurpose::SEND, CT_DELETED)), uint64_t{0});
+    QCOMPARE(addresses->rowCount({}), 2);
+    // An entry no address decodes to, which no row can show.
+    QCOMPARE(passes(change(CNoDestination{}, "nowhere", wallet::AddressPurpose::SEND, CT_NEW)), uint64_t{0});
+
+    // A label added to an entry, changed, removed with its entry, and a new
+    // entry with a label.
+    QCOMPARE(passes(change(carol, "carol", wallet::AddressPurpose::RECEIVE, CT_UPDATED)), uint64_t{1});
+    QCOMPARE(passes(change(alice, "alicia", wallet::AddressPurpose::SEND, CT_UPDATED)), uint64_t{1});
+    QCOMPARE(passes(change(carol, "", wallet::AddressPurpose::RECEIVE, CT_DELETED)), uint64_t{1});
+    QCOMPARE(passes(change(bob, "bob", wallet::AddressPurpose::SEND, CT_NEW)), uint64_t{1});
+    QCOMPARE(TransactionLabel(*table, 0), QStringLiteral("alicia"));
+    QCOMPARE(TransactionLabel(*table, 1), QStringLiteral("bob"));
+    QCOMPARE(TransactionLabel(*table, 2), QString{});
+}
+
+//! A burst of address book changes, as a rescan makes when it files a
+//! receiving entry for each address it finds used, or a script calling
+//! setlabel in a loop, costs one pass over the history and one read of the
+//! wallet's entries, and leaves the rows and the list as delivering the
+//! changes one at a time does.
+void TestLabelChangeBurstMakesOnePass(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    constexpr int ADDRESSES{20};
+    std::vector<CTxDestination> book;
+    book.reserve(ADDRESSES);
+    for (int i = 0; i < ADDRESSES; ++i) book.emplace_back(WitnessV2P2MR{uint256{static_cast<uint8_t>(0x60 + i)}});
+    // Each address is shown by three rows, apart from each other.
+    std::vector<CTxDestination> outputs;
+    for (int round = 0; round < 3; ++round) outputs.insert(outputs.end(), book.begin(), book.end());
+
+    struct Outcome {
+        uint64_t passes{0};
+        int wallet_reads{0};
+        std::vector<QString> labels;
+        std::vector<QString> shown;
+    };
+    const auto deliver{[&](bool burst, Outcome& outcome) {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        for (int i = 0; i < ADDRESSES; ++i) {
+            state->address_book.emplace_back(book[i], /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, strprintf("old%d", i));
+        }
+        state->wallet_tx = MakeSyntheticPayment(outputs, 5);
+        auto model{env.makeModel(state)};
+        TransactionTableModel* const table{model->getTransactionTableModel()};
+        TransactionView view{env.platform_style.get()};
+        view.setModel(model.get());
+        TransactionFilterProxy* const proxy{view.findChild<TransactionFilterProxy*>()};
+        QVERIFY(proxy);
+        proxy->setSearchString(QStringLiteral("new"));
+        QCOMPARE(proxy->rowCount({}), 0);
+
+        // Relabel every address but the last, and remove the last.
+        std::vector<std::function<void()>> changes;
+        for (int i = 0; i + 1 < ADDRESSES; ++i) {
+            changes.push_back(SyntheticAddressBookChange(state, book[i], strprintf("new%d", i), wallet::AddressPurpose::RECEIVE, CT_UPDATED));
+        }
+        changes.push_back(SyntheticAddressBookChange(state, book.back(), "", wallet::AddressPurpose::RECEIVE, CT_DELETED));
+        const uint64_t passes_before{table->labelPassCount()};
+        const int reads_before{SyntheticWalletReads(*state)};
+        if (burst) {
+            NotifyFromOtherThread([&changes] {
+                for (const auto& change : changes) change();
+            });
+        } else {
+            for (const auto& change : changes) NotifyFromOtherThread(change);
+        }
+        outcome.passes = table->labelPassCount() - passes_before;
+        outcome.wallet_reads = SyntheticWalletReads(*state) - reads_before;
+        for (int row = 0; row < table->rowCount({}); ++row) outcome.labels.push_back(TransactionLabel(*table, row));
+        for (int row = 0; row < proxy->rowCount({}); ++row) outcome.shown.push_back(proxy->index(row, 0).data(TransactionTableModel::LabelRole).toString());
+        // Rows with the same date may be listed in either order.
+        std::sort(outcome.shown.begin(), outcome.shown.end());
+    }};
+    Outcome burst;
+    deliver(/*burst=*/true, burst);
+    if (QTest::currentTestFailed()) return;
+    Outcome separate;
+    deliver(/*burst=*/false, separate);
+    if (QTest::currentTestFailed()) return;
+    QCOMPARE(burst.passes, uint64_t{1});
+    QCOMPARE(separate.passes, uint64_t{ADDRESSES});
+    // The models compare the changed entries with the wallet in one read.
+    QCOMPARE(burst.wallet_reads, 1);
+    QCOMPARE(separate.wallet_reads, ADDRESSES);
+    QCOMPARE(burst.labels, separate.labels);
+    QCOMPARE(burst.shown, separate.shown);
+    QCOMPARE(burst.labels.size(), outputs.size());
+    for (size_t row = 0; row < burst.labels.size(); ++row) {
+        const int i{static_cast<int>(row % ADDRESSES)};
+        QCOMPARE(burst.labels[row], i + 1 < ADDRESSES ? QString::fromStdString(strprintf("new%d", i)) : QString{});
+    }
+    QCOMPARE(burst.shown.size(), size_t{3 * (ADDRESSES - 1)});
+}
+
+//! Rows are ordered by transaction, so the rows that show one address are
+//! scattered. Relabelling an address that many rows show sends one signal,
+//! for the address column only, and a label search and a sort on the
+//! address column follow the change: a proxy sorts the rows of a signal
+//! among the others, so it would misplace rows whose labels changed but
+//! that came in a later signal.
+void TestLabelChangeSendsOneSignal(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0x71}}}};
+    const CTxDestination bob{WitnessV2P2MR{uint256{uint8_t{0x72}}}};
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->address_book.emplace_back(bob, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "bob");
+    // Alice shows every other row, so each of her rows is a range of its own.
+    constexpr int ROWS{200};
+    std::vector<CTxDestination> outputs;
+    outputs.reserve(ROWS);
+    for (int row = 0; row < ROWS; ++row) outputs.push_back(row % 2 == 0 ? alice : bob);
+    state->wallet_tx = MakeSyntheticPayment(outputs, 6);
+
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    TransactionView view{env.platform_style.get()};
+    view.setModel(model.get());
+    view.resize(1000, 600);
+    TransactionFilterProxy* const proxy{view.findChild<TransactionFilterProxy*>()};
+    QTableView* const list{view.findChild<QTableView*>()};
+    QVERIFY(proxy);
+    QVERIFY(list);
+    QCOMPARE(table->rowCount({}), ROWS);
+    proxy->setSearchString(QStringLiteral("zed"));
+    QCOMPARE(proxy->rowCount({}), 0);
+
+    QSignalSpy changed{table, &QAbstractItemModel::dataChanged};
+    QVERIFY(changed.isValid());
+    NotifyFromOtherThread(SyntheticAddressBookChange(state, alice, "zed", wallet::AddressPurpose::RECEIVE, CT_UPDATED));
+    QCOMPARE(changed.size(), 1);
+    const std::set<int> notified{NotifiedLabelRows(changed)};
+    QVERIFY(!notified.count(-1));
+    QCOMPARE(*notified.begin(), 0);
+    QCOMPARE(*notified.rbegin(), ROWS - 2);
+    QCOMPARE(proxy->rowCount({}), ROWS / 2);
+
+    // Sorted on the address column, which shows "label (address)", bob's
+    // rows come first; after renaming alice to "able", hers do.
+    proxy->setSearchString(QString{});
+    list->sortByColumn(TransactionTableModel::ToAddress, Qt::AscendingOrder);
+    const auto sorted_labels{[proxy] {
+        std::vector<QString> labels;
+        for (int row = 0; row < proxy->rowCount({}); ++row) labels.push_back(proxy->index(row, 0).data(TransactionTableModel::LabelRole).toString());
+        return labels;
+    }};
+    std::vector<QString> expected(ROWS / 2, QStringLiteral("bob"));
+    expected.resize(ROWS, QStringLiteral("zed"));
+    QCOMPARE(sorted_labels(), expected);
+    NotifyFromOtherThread(SyntheticAddressBookChange(state, alice, "able", wallet::AddressPurpose::RECEIVE, CT_UPDATED));
+    expected.assign(ROWS / 2, QStringLiteral("able"));
+    expected.resize(ROWS, QStringLiteral("bob"));
+    QCOMPARE(sorted_labels(), expected);
+}
+
+//! A listener that adds rows while a label pass notifies them, as a nested
+//! event loop delivering a transaction does, leaves the listeners after it
+//! with row numbers that no longer hold. A later pass notifies the rows
+//! again, by their new numbers, rather than dropping them.
+void TestLabelPassKeepsRowsAfterRowChange(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0x91}}}};
+    const CTxDestination bob{WitnessV2P2MR{uint256{uint8_t{0x92}}}};
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->address_book.emplace_back(bob, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "bob");
+    state->wallet_tx = MakeSyntheticPayment({alice, bob, alice, bob, alice}, 7);
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    QCOMPARE(table->rowCount({}), 5);
+
+    const auto another_payment{SyntheticTransactionChange(state, MakeSyntheticPayment({alice}, 8), CT_NEW)};
+    bool inserted{false};
+    std::set<int> notified_after_insert;
+    QObject::connect(table, &QAbstractItemModel::dataChanged, table, [&](const QModelIndex& top, const QModelIndex& bottom) {
+        if (!inserted) {
+            inserted = true;
+            another_payment();
+            QCoreApplication::sendPostedEvents();
+            return;
+        }
+        for (int row = top.row(); row <= bottom.row(); ++row) notified_after_insert.insert(row);
+    });
+    NotifyFromOtherThread(SyntheticAddressBookChange(state, alice, "carol", wallet::AddressPurpose::RECEIVE, CT_UPDATED));
+    QCoreApplication::sendPostedEvents();
+    QVERIFY(inserted);
+    QCOMPARE(table->rowCount({}), 6);
+    std::set<int> alice_rows;
+    for (int row = 0; row < table->rowCount({}); ++row) {
+        if (table->index(row, 0).data(TransactionTableModel::AddressRole).toString() == QString::fromStdString(EncodeDestination(alice))) alice_rows.insert(row);
+    }
+    QCOMPARE(alice_rows.size(), size_t{4});
+    for (int row : alice_rows) {
+        QVERIFY2(notified_after_insert.count(row), qPrintable(QString::number(row)));
+        QCOMPARE(TransactionLabel(*table, row), QStringLiteral("carol"));
+    }
+}
+
+//! A payment the wallet cannot attribute to one of its addresses shows the
+//! address the wallet stored as text. A spelling that decodes to an
+//! address, one in upper case or with surrounding white space, shows that
+//! address's label and follows it; one that does not decode shows none.
+void TestStoredAddressTextFollowsLabel(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    const CTxDestination bech32{WitnessV2P2MR{uint256{uint8_t{0x81}}}};
+    const CTxDestination base58{PKHash{uint160{std::vector<unsigned char>(20, 0x82)}}};
+    const CTxDestination other{WitnessV2P2MR{uint256{uint8_t{0x83}}}};
+    const std::string bech32_text{EncodeDestination(bech32)};
+    struct Case {
+        CTxDestination dest;
+        std::string stored;
+        bool shows_label;
+    };
+    const std::array<Case, 3> cases{{
+        {bech32, ToUpper(bech32_text), true},
+        {base58, " " + EncodeDestination(base58) + "\t\n", true},
+        // bech32 does not allow surrounding white space.
+        {bech32, " " + bech32_text, false},
+    }};
+    for (const Case& test : cases) {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        state->address_book.emplace_back(test.dest, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "before");
+        state->address_book.emplace_back(other, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "other");
+        // Output 0 pays the address. Output 1 is the wallet's but not paid to
+        // one of its addresses, so its row shows the text the wallet stored.
+        interfaces::WalletTx payment{MakeSyntheticPayment({test.dest, other}, 9)};
+        payment.txout_address_is_mine[1] = false;
+        payment.value_map["from"] = test.stored;
+        state->wallet_tx = payment;
+        auto model{env.makeModel(state)};
+        TransactionTableModel* const table{model->getTransactionTableModel()};
+        TransactionView view{env.platform_style.get()};
+        view.setModel(model.get());
+        TransactionFilterProxy* const proxy{view.findChild<TransactionFilterProxy*>()};
+        QVERIFY(proxy);
+        QCOMPARE(table->rowCount({}), 2);
+        QCOMPARE(table->index(1, 0).data(TransactionTableModel::TypeRole).toInt(), static_cast<int>(TransactionRecord::RecvFromOther));
+        QCOMPARE(table->index(1, 0).data(TransactionTableModel::AddressRole).toString(), QString::fromStdString(test.stored));
+        QCOMPARE(TransactionLabel(*table, 1), test.shows_label ? QStringLiteral("before") : QString{});
+        proxy->setSearchString(QStringLiteral("after"));
+
+        QSignalSpy changed{table, &QAbstractItemModel::dataChanged};
+        QVERIFY(changed.isValid());
+        NotifyFromOtherThread(SyntheticAddressBookChange(state, test.dest, "after", wallet::AddressPurpose::RECEIVE, CT_UPDATED));
+        QCOMPARE(NotifiedLabelRows(changed), test.shows_label ? (std::set<int>{0, 1}) : (std::set<int>{0}));
+        QCOMPARE(TransactionLabel(*table, 1), test.shows_label ? QStringLiteral("after") : QString{});
+        QCOMPARE(proxy->rowCount({}), test.shows_label ? 2 : 1);
+    }
+}
+
+//! An address that does not decode, or a row without an address, has no
+//! label, as the wallet finds no entry for it, even if the address table
+//! holds an entry whose encoding is the empty string such an address
+//! encodes to.
+void TestUndecodableAddressHasNoLabel(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0xa1}}}};
+    const CTxDestination other{WitnessV2P2MR{uint256{uint8_t{0xa2}}}};
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->address_book.emplace_back(CNoDestination{}, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "ghost");
+    // Output 1 is the wallet's but not paid to one of its addresses, and the
+    // wallet stored no text for it, so its row has no address.
+    interfaces::WalletTx payment{MakeSyntheticPayment({alice, other}, 10)};
+    payment.txout_address_is_mine[1] = false;
+    state->wallet_tx = payment;
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    QCOMPARE(addresses->rowCount({}), 2);
+    QCOMPARE(addresses->lookupAddress(QString{}), 0);
+    QCOMPARE(table->rowCount({}), 2);
+    QCOMPARE(table->index(1, 0).data(TransactionTableModel::AddressRole).toString(), QString{});
+    QCOMPARE(TransactionLabel(*table, 0), QStringLiteral("alice"));
+    QCOMPARE(TransactionLabel(*table, 1), QString{});
+    for (const QString& address : {QString{}, QStringLiteral("not an address"), QStringLiteral(" ")}) {
+        QCOMPARE(addresses->cachedLabelForAddress(address), QString{});
+    }
+}
+
+//! Another thread holds the synthetic wallet's lock stand-in, as the wallet
+//! holds cs_wallet while it connects a block, until release() or the end of
+//! the scope. Its bound only ends a test whose GUI thread waits for the lock.
+class SyntheticWalletLockHolder
+{
+public:
+    explicit SyntheticWalletLockHolder(std::shared_ptr<qt_test::SyntheticWalletState> state) : m_state{std::move(state)}
+    {
+        m_thread = std::thread{[this] {
+            std::unique_lock lock{m_state->mutex};
+            m_state->wallet_lock_held = true;
+            m_state->wallet_lock_owner = std::this_thread::get_id();
+            m_state->condition.notify_all();
+            m_state->condition.wait_for(lock, std::chrono::seconds{60}, [this] { return m_release; });
+            m_state->wallet_lock_held = false;
+            m_state->wallet_lock_owner = {};
+            m_state->condition.notify_all();
+        }};
+        std::unique_lock lock{m_state->mutex};
+        m_state->condition.wait_for(lock, std::chrono::seconds{60}, [this] { return m_state->wallet_lock_held || m_release; });
+    }
+    ~SyntheticWalletLockHolder() { release(); }
+    void release()
+    {
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_release = true;
+        }
+        m_state->condition.notify_all();
+        if (m_thread.joinable()) m_thread.join();
+    }
+
+private:
+    std::shared_ptr<qt_test::SyntheticWalletState> m_state;
+    //! Guarded by m_state->mutex.
+    bool m_release{false};
+    std::thread m_thread;
+};
+
+//! Two writers relabel one address: the first writes "zoe", the second
+//! "abe". CWallet::SetAddressBookWithDB notifies after releasing the wallet
+//! lock, so the notifications can arrive as "abe" and then "zoe". The models
+//! take them in that order and then compare the address with the wallet, so
+//! the address table, the transaction rows, a label search and a sort on the
+//! address column end at the wallet's "abe".
+void TestReorderedLabelNotificationsConverge(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0xc1}}}};
+    const CTxDestination bob{WitnessV2P2MR{uint256{uint8_t{0xc2}}}};
+    const QString alice_text{QString::fromStdString(EncodeDestination(alice))};
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "carl");
+    state->address_book.emplace_back(bob, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "bob");
+    state->wallet_tx = MakeSyntheticPayment({alice, bob, alice, bob, alice, bob}, 12);
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    TransactionView view{env.platform_style.get()};
+    view.setModel(model.get());
+    TransactionFilterProxy* const proxy{view.findChild<TransactionFilterProxy*>()};
+    QTableView* const list{view.findChild<QTableView*>()};
+    QVERIFY(proxy);
+    QVERIFY(list);
+    list->sortByColumn(TransactionTableModel::ToAddress, Qt::AscendingOrder);
+    const auto sorted_labels{[proxy] {
+        std::vector<QString> labels;
+        for (int row = 0; row < proxy->rowCount({}); ++row) labels.push_back(proxy->index(row, 0).data(TransactionTableModel::LabelRole).toString());
+        return labels;
+    }};
+
+    // Both writes have been made; the wallet holds the second.
+    SetSyntheticAddressBookEntry(state, alice, "abe", wallet::AddressPurpose::RECEIVE);
+    const int reads_before{SyntheticWalletReads(*state)};
+    std::thread{[&state, &alice] {
+        SyntheticLateAddressBookNotification(state, alice, "abe", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+        SyntheticLateAddressBookNotification(state, alice, "zoe", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+    }}.join();
+    // The notifications, in the order they arrived.
+    QCoreApplication::sendPostedEvents();
+    QCOMPARE(addresses->cachedLabelForAddress(alice_text), QStringLiteral("zoe"));
+    // Then the comparison with the wallet.
+    DeliverPostedEvents();
+    QCOMPARE(SyntheticWalletReads(*state) - reads_before, 1);
+    QCOMPARE(addresses->cachedLabelForAddress(alice_text), QStringLiteral("abe"));
+    QCOMPARE(addresses->index(addresses->lookupAddress(alice_text), AddressTableModel::Label, {}).data(Qt::EditRole).toString(), QStringLiteral("abe"));
+    for (int row : {0, 2, 4}) QCOMPARE(TransactionLabel(*table, row), QStringLiteral("abe"));
+    const std::vector<QString> expected{QStringLiteral("abe"), QStringLiteral("abe"), QStringLiteral("abe"),
+                                        QStringLiteral("bob"), QStringLiteral("bob"), QStringLiteral("bob")};
+    QCOMPARE(sorted_labels(), expected);
+    proxy->setSearchString(QStringLiteral("zoe"));
+    QCOMPARE(proxy->rowCount({}), 0);
+    proxy->setSearchString(QStringLiteral("abe"));
+    QCOMPARE(proxy->rowCount({}), 3);
+}
+
+//! An entry added and removed, or removed and added again, by writers whose
+//! notifications arrive the other way round, ends as the wallet holds it.
+void TestReorderedAddAndRemoveConverge(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination carol{WitnessV2P2MR{uint256{uint8_t{0xd1}}}};
+    const CTxDestination dave{WitnessV2P2MR{uint256{uint8_t{0xd2}}}};
+    const QString carol_text{QString::fromStdString(EncodeDestination(carol))};
+    const QString dave_text{QString::fromStdString(EncodeDestination(dave))};
+    state->address_book.emplace_back(dave, /*is_mine=*/false, wallet::AddressPurpose::SEND, "eve");
+    state->wallet_tx = MakeSyntheticPayment({carol, dave}, 13);
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    QCOMPARE(addresses->rowCount({}), 1);
+
+    // Carol is added as "dora" and removed again, but the removal is
+    // delivered first, and then the addition.
+    // Dave is removed and added again as "eve2", but the addition is
+    // delivered first, while his old entry is still listed, and then the
+    // removal.
+    SetSyntheticAddressBookEntry(state, dave, "eve2", wallet::AddressPurpose::SEND);
+    std::thread{[&] {
+        SyntheticLateAddressBookNotification(state, carol, "", wallet::AddressPurpose::SEND, CT_DELETED)();
+        SyntheticLateAddressBookNotification(state, carol, "dora", wallet::AddressPurpose::SEND, CT_NEW)();
+        SyntheticLateAddressBookNotification(state, dave, "eve2", wallet::AddressPurpose::SEND, CT_NEW)();
+        SyntheticLateAddressBookNotification(state, dave, "", wallet::AddressPurpose::SEND, CT_DELETED)();
+    }}.join();
+    QCoreApplication::sendPostedEvents();
+    QVERIFY(addresses->lookupAddress(carol_text) >= 0);
+    QCOMPARE(addresses->lookupAddress(dave_text), -1);
+    DeliverPostedEvents();
+    QCOMPARE(addresses->lookupAddress(carol_text), -1);
+    QCOMPARE(addresses->cachedLabelForAddress(dave_text), QStringLiteral("eve2"));
+    QCOMPARE(addresses->rowCount({}), 1);
+    QCOMPARE(TransactionLabel(*table, 0), QString{});
+    QCOMPARE(TransactionLabel(*table, 1), QStringLiteral("eve2"));
+}
+
+//! While another thread holds the wallet lock, the comparison with the
+//! wallet does not wait for it: it keeps the addresses, tries again after
+//! MODEL_UPDATE_DELAY, takes in the addresses notified meanwhile, and
+//! brings the models to the wallet's state once the lock is free.
+void TestAddressBookReconcileWaitsForFreeLock(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0xe1}}}};
+    const CTxDestination bob{WitnessV2P2MR{uint256{uint8_t{0xe2}}}};
+    const QString alice_text{QString::fromStdString(EncodeDestination(alice))};
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "carl");
+    state->address_book.emplace_back(bob, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "bob");
+    state->wallet_tx = MakeSyntheticPayment({alice, bob}, 14);
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    const int reads_before{SyntheticWalletReads(*state)};
+    int calls_before{0};
+    {
+        std::lock_guard lock{state->mutex};
+        calls_before = state->get_address_calls;
+    }
+
+    SyntheticWalletLockHolder holder{state};
+    SetSyntheticAddressBookEntry(state, alice, "abe", wallet::AddressPurpose::RECEIVE);
+    NotifyFromOtherThread([&] {
+        SyntheticLateAddressBookNotification(state, alice, "abe", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+        SyntheticLateAddressBookNotification(state, alice, "zoe", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+    });
+    QCOMPARE(SyntheticWalletReads(*state) - reads_before, 1);
+    QCOMPARE(addresses->cachedLabelForAddress(alice_text), QStringLiteral("zoe"));
+    QTimer* const retry{model->findChild<QTimer*>(QStringLiteral("addressBookRetryTimer"))};
+    QVERIFY(retry);
+    QVERIFY(retry->isActive());
+    QCOMPARE(retry->interval(), static_cast<int>(std::chrono::milliseconds{MODEL_UPDATE_DELAY}.count()));
+    // A notification while the retry waits is kept for it, not read at once.
+    NotifyFromOtherThread(SyntheticAddressBookChange(state, bob, "bea", wallet::AddressPurpose::RECEIVE, CT_UPDATED));
+    QCOMPARE(SyntheticWalletReads(*state) - reads_before, 1);
+
+    holder.release();
+    {
+        std::lock_guard lock{state->mutex};
+        QCOMPARE(state->get_address_calls, calls_before);
+    }
+    // The timer fires.
+    retry->stop();
+    QVERIFY(QMetaObject::invokeMethod(retry, "timeout"));
+    DeliverPostedEvents();
+    QCOMPARE(SyntheticWalletReads(*state) - reads_before, 2);
+    QVERIFY(!retry->isActive());
+    QCOMPARE(addresses->cachedLabelForAddress(alice_text), QStringLiteral("abe"));
+    QCOMPARE(TransactionLabel(*table, 0), QStringLiteral("abe"));
+    QCOMPARE(TransactionLabel(*table, 1), QStringLiteral("bea"));
+}
+
+//! When the notifications arrived in the order of the writes, the
+//! comparison with the wallet finds nothing to change: it updates no
+//! address table row and queues no label pass.
+void TestAddressBookReconcileInOrderChangesNothing(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0xf1}}}};
+    const CTxDestination bob{WitnessV2P2MR{uint256{uint8_t{0xf2}}}};
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->wallet_tx = MakeSyntheticPayment({alice, bob}, 15);
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    const int reads_before{SyntheticWalletReads(*state)};
+    const uint64_t passes_before{table->labelPassCount()};
+
+    std::thread{[&] {
+        SyntheticAddressBookChange(state, alice, "anna", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+        SyntheticAddressBookChange(state, bob, "bo", wallet::AddressPurpose::SEND, CT_NEW)();
+        SyntheticAddressBookChange(state, bob, "", wallet::AddressPurpose::SEND, CT_DELETED)();
+    }}.join();
+    // The notifications.
+    QCoreApplication::sendPostedEvents();
+    QSignalSpy changed{addresses, &QAbstractItemModel::dataChanged};
+    QSignalSpy inserted{addresses, &QAbstractItemModel::rowsInserted};
+    QSignalSpy removed{addresses, &QAbstractItemModel::rowsRemoved};
+    // The label pass they queued and the comparison with the wallet.
+    DeliverPostedEvents();
+    QCOMPARE(SyntheticWalletReads(*state) - reads_before, 1);
+    QCOMPARE(changed.size(), 0);
+    QCOMPARE(inserted.size(), 0);
+    QCOMPARE(removed.size(), 0);
+    QCOMPARE(table->labelPassCount() - passes_before, uint64_t{1});
+    QCOMPARE(TransactionLabel(*table, 0), QStringLiteral("anna"));
+    QCOMPARE(TransactionLabel(*table, 1), QString{});
+}
+
+//! The wallet model can be deleted while a comparison with the wallet is
+//! queued or its retry timer is armed: neither runs afterwards.
+void TestModelDeletedWithAddressBookReconcilePending(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0xa5}}}};
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->wallet_tx = MakeSyntheticPayment({alice}, 16);
+
+    // Queued.
+    {
+        auto model{env.makeModel(state)};
+        std::thread{SyntheticAddressBookChange(state, alice, "anna", wallet::AddressPurpose::RECEIVE, CT_UPDATED)}.join();
+        QCoreApplication::sendPostedEvents();
+        QCOMPARE(model->getAddressTableModel()->cachedLabelForAddress(QString::fromStdString(EncodeDestination(alice))), QStringLiteral("anna"));
+        const int reads_before{SyntheticWalletReads(*state)};
+        model.reset();
+        DeliverPostedEvents();
+        QCOMPARE(SyntheticWalletReads(*state), reads_before);
+    }
+
+    // Waiting for its retry.
+    auto model{env.makeModel(state)};
+    {
+        SyntheticWalletLockHolder holder{state};
+        NotifyFromOtherThread(SyntheticAddressBookChange(state, alice, "ada", wallet::AddressPurpose::RECEIVE, CT_UPDATED));
+    }
+    QPointer<QTimer> retry{model->findChild<QTimer*>(QStringLiteral("addressBookRetryTimer"))};
+    QVERIFY(retry);
+    QVERIFY(retry->isActive());
+    const int reads_before{SyntheticWalletReads(*state)};
+    model.reset();
+    QVERIFY(retry.isNull());
+    DeliverPostedEvents();
+    QCOMPARE(SyntheticWalletReads(*state), reads_before);
+}
+
+//! The message signing dialog has the wallet model hand out an address
+//! table model that lists only legacy addresses. Comparing a notified entry
+//! with the wallet gives that model no entry a notification would not give
+//! it.
+void TestAddressBookReconcileKeepsLegacyOnlyModel(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination legacy{PKHash{uint160{std::vector<unsigned char>(20, 0x5a)}}};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0x5b}}}};
+    const QString alice_text{QString::fromStdString(EncodeDestination(alice))};
+    state->address_book.emplace_back(legacy, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "lee");
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "carl");
+    state->wallet_tx = MakeSyntheticPayment({legacy, alice}, 17);
+    auto model{env.makeModel(state)};
+    AddressTableModel* const complete{model->getAddressTableModel()};
+    model->refresh(/*pk_hash_only=*/true);
+    AddressTableModel* const legacy_only{model->getAddressTableModel()};
+    QVERIFY(legacy_only != complete);
+    QCOMPARE(legacy_only->rowCount({}), 1);
+
+    // A relabel of alice in order, and then two whose notifications arrive
+    // the other way round.
+    NotifyFromOtherThread(SyntheticAddressBookChange(state, alice, "cara", wallet::AddressPurpose::RECEIVE, CT_UPDATED));
+    SetSyntheticAddressBookEntry(state, alice, "abe", wallet::AddressPurpose::RECEIVE);
+    NotifyFromOtherThread([&] {
+        SyntheticLateAddressBookNotification(state, alice, "abe", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+        SyntheticLateAddressBookNotification(state, alice, "zoe", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+    });
+    QCOMPARE(complete->cachedLabelForAddress(alice_text), QStringLiteral("abe"));
+    QCOMPARE(legacy_only->rowCount({}), 1);
+    QCOMPARE(legacy_only->lookupAddress(alice_text), -1);
+}
+
+//! An entry the wallet holds under a destination its address string does
+//! not decode to, such as a public key, whose encoding is the empty string,
+//! cannot be looked up by that string: the wallet read would find no entry
+//! and the comparison would remove the row. The row stays as its
+//! notifications left it, and no read is made for it.
+void TestAddressBookReconcileSkipsUndecodableEntry(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination key{PubKeyDestination{GenerateRandomKey().GetPubKey()}};
+    const CTxDestination alice{WitnessV2P2MR{uint256{uint8_t{0x61}}}};
+    QVERIFY(EncodeDestination(key).empty());
+    state->address_book.emplace_back(key, /*is_mine=*/false, wallet::AddressPurpose::SEND, "key");
+    state->address_book.emplace_back(alice, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->wallet_tx = MakeSyntheticPayment({alice}, 18);
+    auto model{env.makeModel(state)};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    const auto key_row_label{[addresses] {
+        const int row{addresses->lookupAddress(QString{})};
+        return row < 0 ? QStringLiteral("(not listed)") : addresses->index(row, AddressTableModel::Label, {}).data(Qt::EditRole).toString();
+    }};
+    QCOMPARE(key_row_label(), QStringLiteral("key"));
+
+    const int reads_before{SyntheticWalletReads(*state)};
+    NotifyFromOtherThread(SyntheticAddressBookChange(state, key, "key2", wallet::AddressPurpose::SEND, CT_UPDATED));
+    QCOMPARE(key_row_label(), QStringLiteral("key2"));
+    QCOMPARE(addresses->rowCount({}), 2);
+    QCOMPARE(SyntheticWalletReads(*state) - reads_before, 0);
+}
+
+//! The comparison with the wallet reads every recorded entry, then applies
+//! the differences one by one. If a listener of one row runs a nested event
+//! loop that delivers a newer notification for an address still to come,
+//! the entry read for that address is older than the notification, so it is
+//! read again instead of applied.
+void TestAddressBookReconcileRereadsAfterNestedNotification(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    // The comparison goes through the addresses in the order of their
+    // encodings, so name them by it.
+    std::array<CTxDestination, 2> dests{CTxDestination{WitnessV2P2MR{uint256{uint8_t{0x62}}}}, CTxDestination{WitnessV2P2MR{uint256{uint8_t{0x63}}}}};
+    if (EncodeDestination(dests[1]) < EncodeDestination(dests[0])) std::swap(dests[0], dests[1]);
+    const CTxDestination& first{dests[0]};
+    const CTxDestination& second{dests[1]};
+    const QString first_text{QString::fromStdString(EncodeDestination(first))};
+    const QString second_text{QString::fromStdString(EncodeDestination(second))};
+    state->address_book.emplace_back(first, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "f0");
+    state->address_book.emplace_back(second, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "s0");
+    state->wallet_tx = MakeSyntheticPayment({first, second}, 19);
+    auto model{env.makeModel(state)};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+
+    // Both entries were written twice and the notifications arrive the other
+    // way round, so the comparison has to correct both.
+    SetSyntheticAddressBookEntry(state, first, "f2", wallet::AddressPurpose::RECEIVE);
+    SetSyntheticAddressBookEntry(state, second, "s2", wallet::AddressPurpose::RECEIVE);
+    std::thread{[&] {
+        for (const auto& [dest, label] : {std::pair{first, "f2"}, std::pair{first, "f1"}, std::pair{second, "s2"}, std::pair{second, "s1"}}) {
+            SyntheticLateAddressBookNotification(state, dest, label, wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+        }
+    }}.join();
+    QCoreApplication::sendPostedEvents();
+    QCOMPARE(addresses->cachedLabelForAddress(first_text), QStringLiteral("f1"));
+    QCOMPARE(addresses->cachedLabelForAddress(second_text), QStringLiteral("s1"));
+
+    // While the comparison corrects the first, a listener runs a nested event
+    // loop in which the second is relabelled again, as from the GUI, and
+    // that notification is applied and compared with the wallet.
+    bool nested{false};
+    QObject::connect(addresses, &QAbstractItemModel::dataChanged, addresses, [&](const QModelIndex& top) {
+        if (nested || addresses->index(top.row(), AddressTableModel::Address, {}).data(Qt::EditRole).toString() != first_text) return;
+        nested = true;
+        SyntheticAddressBookChange(state, second, "s3", wallet::AddressPurpose::RECEIVE, CT_UPDATED)();
+        QCoreApplication::sendPostedEvents();
+    });
+    DeliverPostedEvents();
+    QVERIFY(nested);
+    QCOMPARE(addresses->cachedLabelForAddress(first_text), QStringLiteral("f2"));
+    QCOMPARE(addresses->cachedLabelForAddress(second_text), QStringLiteral("s3"));
+    QCOMPARE(TransactionLabel(*table, 0), QStringLiteral("f2"));
+    QCOMPARE(TransactionLabel(*table, 1), QStringLiteral("s3"));
+}
+
+//! While the message signing dialog's legacy-only model is the current one,
+//! the comparison with the wallet changes both models as the notifications
+//! would have, had they arrived in the order of the writes: a legacy entry
+//! relabelled (CT_UPDATED for a row both models list), a non-legacy entry
+//! removed and added again (CT_NEW) and a legacy entry added and removed
+//! again (CT_DELETED).
+void TestAddressBookReconcileWithLegacyOnlyModel(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    const CTxDestination lee{PKHash{uint160{std::vector<unsigned char>(20, 0x71)}}};
+    const CTxDestination lou{PKHash{uint160{std::vector<unsigned char>(20, 0x72)}}};
+    const CTxDestination nina{WitnessV2P2MR{uint256{uint8_t{0x73}}}};
+    struct Write {
+        CTxDestination dest;
+        std::string label;
+        ChangeType status;
+    };
+    struct Scenario {
+        const char* name;
+        std::vector<Write> writes;
+    };
+    const std::array<Scenario, 3> scenarios{{
+        {"legacy relabelled", {{lee, "lee1", CT_UPDATED}, {lee, "lee2", CT_UPDATED}}},
+        {"non-legacy removed and added again", {{nina, "", CT_DELETED}, {nina, "nina2", CT_NEW}}},
+        {"legacy added and removed again", {{lou, "lou", CT_NEW}, {lou, "", CT_DELETED}}},
+    }};
+    // The rows of a model, as address and label.
+    const auto rows{[](const AddressTableModel& table) {
+        std::vector<std::pair<QString, QString>> rows;
+        for (int row = 0; row < table.rowCount({}); ++row) {
+            rows.emplace_back(table.index(row, AddressTableModel::Address, {}).data(Qt::EditRole).toString(),
+                              table.index(row, AddressTableModel::Label, {}).data(Qt::EditRole).toString());
+        }
+        return rows;
+    }};
+    const auto encode{[](const CTxDestination& dest) { return QString::fromStdString(EncodeDestination(dest)); }};
+    const auto row{[&encode](const CTxDestination& dest, const char* label) { return std::pair{encode(dest), QString::fromUtf8(label)}; }};
+    const std::array<std::vector<std::pair<QString, QString>>, 3> legacy_expected{{
+        {row(lee, "lee2")},
+        {row(lee, "lee"), row(nina, "nina2")},
+        {row(lee, "lee")},
+    }};
+    for (size_t i = 0; i < scenarios.size(); ++i) {
+        const Scenario& scenario{scenarios[i]};
+        std::array<std::vector<std::pair<QString, QString>>, 2> complete_rows;
+        std::array<std::vector<std::pair<QString, QString>>, 2> legacy_rows;
+        for (const bool reordered : {false, true}) {
+            auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+            state->address_book.emplace_back(lee, /*is_mine=*/false, wallet::AddressPurpose::SEND, "lee");
+            state->address_book.emplace_back(nina, /*is_mine=*/false, wallet::AddressPurpose::SEND, "nina");
+            state->wallet_tx = MakeSyntheticPayment({lee, lou, nina}, 20);
+            auto model{env.makeModel(state)};
+            AddressTableModel* const complete{model->getAddressTableModel()};
+            model->refresh(/*pk_hash_only=*/true);
+            AddressTableModel* const legacy_only{model->getAddressTableModel()};
+            QCOMPARE(legacy_only->rowCount({}), 1);
+            // The wallet holds the result of the writes; the notifications
+            // arrive in their order or the other way round.
+            for (const Write& write : scenario.writes) {
+                SetSyntheticAddressBookEntry(state, write.dest, write.status == CT_DELETED ? std::nullopt : std::optional{write.label}, wallet::AddressPurpose::SEND);
+            }
+            std::vector<Write> arrivals{scenario.writes};
+            if (reordered) std::reverse(arrivals.begin(), arrivals.end());
+            NotifyFromOtherThread([&] {
+                for (const Write& write : arrivals) SyntheticLateAddressBookNotification(state, write.dest, write.label, wallet::AddressPurpose::SEND, write.status)();
+            });
+            complete_rows[reordered] = rows(*complete);
+            legacy_rows[reordered] = rows(*legacy_only);
+        }
+        QVERIFY2(complete_rows[0] == complete_rows[1], scenario.name);
+        QVERIFY2(legacy_rows[0] == legacy_rows[1], scenario.name);
+        // The legacy-only model lists the relabelled legacy entry, the
+        // non-legacy entry a CT_NEW gives it as a notification would, and
+        // not the removed one.
+        std::vector<std::pair<QString, QString>> expected{legacy_expected[i]};
+        std::sort(expected.begin(), expected.end());
+        std::vector<std::pair<QString, QString>> shown{legacy_rows[1]};
+        std::sort(shown.begin(), shown.end());
+        QVERIFY2(shown == expected, scenario.name);
+    }
+}
+
+//! Compare the label of each address in the address table model the
+//! transaction list reads, and of each transaction row, with the one the
+//! wallet gives.
+void VerifyLabelsMatchWallet(WalletModel& wallet_model, const AddressTableModel& labels, const QStringList& addresses)
+{
+    const auto wallet_label{[&wallet_model](const QString& address) {
+        std::string name;
+        if (!wallet_model.wallet().getAddress(DecodeDestination(address.toStdString()), &name, /*purpose=*/nullptr)) return QString{};
+        return QString::fromStdString(name);
+    }};
+    for (const QString& address : addresses) {
+        const QString cached{labels.cachedLabelForAddress(address)};
+        const QString expected{wallet_label(address)};
+        QVERIFY2(cached == expected, qPrintable(QStringLiteral("\"%1\": shown \"%2\", wallet \"%3\"").arg(address, cached, expected)));
+    }
+    TransactionTableModel* const transactions{wallet_model.getTransactionTableModel()};
+    for (int row = 0; row < transactions->rowCount({}); ++row) {
+        const QModelIndex index{transactions->index(row, TransactionTableModel::ToAddress)};
+        const QString address{index.data(TransactionTableModel::AddressRole).toString()};
+        const QString shown{index.data(TransactionTableModel::LabelRole).toString()};
+        const QString expected{wallet_label(address)};
+        QVERIFY2(shown == expected, qPrintable(QStringLiteral("row %1 \"%2\": shown \"%3\", wallet \"%4\"").arg(row).arg(address, shown, expected)));
+    }
+}
+
+//! Labels shown from the address table model equal the wallet's for every
+//! address book state: no entry, an empty label, receiving and sending
+//! entries, a change address the address book holds data for, an entry
+//! removed, relabelled or added, with the change delivered at once or queued,
+//! and for spellings the wallet decodes or rejects. They stay equal after the
+//! message signing dialog has had the wallet model hand out a model that
+//! lists only legacy addresses, and reading them never waits for the wallet
+//! lock.
+void TestTransactionLabelsMatchWallet(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0", "-keypool=1"}}};
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    node.setContext(&test.m_node);
+    const std::shared_ptr<CWallet> wallet{SetupDescriptorsWallet(node, test, /*watch_only=*/false, /*coinbase_offset=*/0,
+                                                                 QT_WALLET_BECH32_DESCRIPTOR_OUTPUT_TYPES, /*fund_wallet=*/false)};
+    {
+        const CBlockIndex* const tip{WITH_LOCK(node.context()->chainman->GetMutex(), return node.context()->chainman->ActiveChain().Tip())};
+        LOCK(wallet->cs_wallet);
+        wallet->SetLastBlockProcessed(tip->nHeight, tip->GetBlockHash());
+    }
+
+    std::vector<CTxDestination> receiving;
+    for (const char* label : {"alice", ""}) {
+        auto dest{wallet->GetNewDestination(OutputType::BECH32, label)};
+        QVERIFY(dest);
+        receiving.push_back(*dest);
+    }
+    std::vector<CTxDestination> change;
+    for (int i = 0; i < 2; ++i) {
+        auto dest{wallet->GetNewChangeDestination(OutputType::BECH32)};
+        QVERIFY(dest);
+        change.push_back(*dest);
+    }
+    const CTxDestination& receive_labelled{receiving[0]};
+    const CTxDestination& receive_blank{receiving[1]};
+    // SetupDescriptorsWallet files the coinbase key's legacy address with an
+    // empty label.
+    const CTxDestination legacy{PKHash{test.coinbaseKey.GetPubKey()}};
+    // A change address the address book holds only spending data for, which
+    // getAddresses() and getAddress() leave out, and one it holds nothing for.
+    const CTxDestination& change_with_data{change[0]};
+    const CTxDestination& change_unfiled{change[1]};
+    const CTxDestination send_legacy{PKHash{GenerateRandomKey().GetPubKey()}};
+    const CTxDestination send_segwit{WitnessV0KeyHash{GenerateRandomKey().GetPubKey()}};
+    const CTxDestination send_p2mr{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000041")}};
+    const CTxDestination send_blank{WitnessV0KeyHash{GenerateRandomKey().GetPubKey()}};
+    const CTxDestination removed{WitnessV0KeyHash{GenerateRandomKey().GetPubKey()}};
+    const CTxDestination never{WitnessV0KeyHash{GenerateRandomKey().GetPubKey()}};
+    QVERIFY(wallet->SetAddressBook(legacy, "miner", /*purpose=*/{}));
+    QVERIFY(wallet->SetAddressBook(send_legacy, "bob", wallet::AddressPurpose::SEND));
+    QVERIFY(wallet->SetAddressBook(send_segwit, "carol", wallet::AddressPurpose::SEND));
+    QVERIFY(wallet->SetAddressBook(send_p2mr, "erin", wallet::AddressPurpose::SEND));
+    QVERIFY(wallet->SetAddressBook(send_blank, "", wallet::AddressPurpose::SEND));
+    QVERIFY(wallet->SetAddressBook(removed, "dave", wallet::AddressPurpose::SEND));
+    QVERIFY(wallet->DelAddressBook(removed));
+
+    // A payment to every receiving and change address, and one spending it to
+    // every sending address, so the transaction list has a row for each.
+    CMutableTransaction payment;
+    payment.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    for (const CTxDestination& dest : {receive_labelled, receive_blank, legacy, change_with_data, change_unfiled}) {
+        payment.vout.emplace_back(COIN, GetScriptForDestination(dest));
+    }
+    const CTransactionRef payment_tx{MakeTransactionRef(payment)};
+    CMutableTransaction spend;
+    spend.vin.emplace_back(COutPoint{payment_tx->GetHash(), 0});
+    for (const CTxDestination& dest : {send_legacy, send_segwit, send_p2mr, send_blank, removed, never}) {
+        spend.vout.emplace_back(COIN / 10, GetScriptForDestination(dest));
+    }
+    {
+        LOCK(wallet->cs_wallet);
+        wallet::WalletBatch batch{wallet->GetDatabase()};
+        QVERIFY(wallet->SetAddressPreviouslySpent(batch, change_with_data, /*used=*/true));
+        QVERIFY(wallet->AddToWallet(payment_tx, wallet::TxStateInactive{}));
+        QVERIFY(wallet->AddToWallet(MakeTransactionRef(spend), wallet::TxStateInactive{}));
+    }
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    MiniGUI mini_gui{node, platform_style.get()};
+    mini_gui.initModelForWallet(node, wallet, platform_style.get());
+    WalletModel& wallet_model{*mini_gui.walletModel};
+    TransactionTableModel* const transactions{wallet_model.getTransactionTableModel()};
+    // The model the address book pages show and the transaction list reads.
+    AddressTableModel* const labels{wallet_model.getAddressTableModel()};
+    QCOMPARE(transactions->rowCount({}), 11);
+
+    const auto encode{[](const CTxDestination& dest) { return QString::fromStdString(EncodeDestination(dest)); }};
+    QStringList addresses;
+    for (const CTxDestination& dest : {receive_labelled, receive_blank, legacy, change_with_data, change_unfiled,
+                                       send_legacy, send_segwit, send_p2mr, send_blank, removed, never}) {
+        addresses << encode(dest);
+    }
+    // Spellings the wallet decodes to a filed address, and strings it rejects.
+    addresses << encode(receive_labelled).toUpper() << encode(send_segwit).toUpper()
+              << QStringLiteral(" %1\t").arg(encode(legacy)) << encode(legacy).toUpper()
+              << encode(send_legacy).chopped(1) + QStringLiteral("x") << QStringLiteral("not an address") << QString{};
+    const auto shown_label{[labels, &encode](const CTxDestination& dest) {
+        return labels->cachedLabelForAddress(encode(dest));
+    }};
+
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
+    if (QTest::currentTestFailed()) return;
+    QCOMPARE(labels->cachedLabelForAddress(encode(receive_labelled).toUpper()), QStringLiteral("alice"));
+    QCOMPARE(labels->cachedLabelForAddress(QStringLiteral(" %1\t").arg(encode(legacy))), QStringLiteral("miner"));
+    QCOMPARE(shown_label(send_p2mr), QStringLiteral("erin"));
+
+    // Changes the GUI makes reach the model at once.
+    QVERIFY(wallet->SetAddressBook(receive_labelled, "alice2", /*purpose=*/{}));
+    QVERIFY(wallet->DelAddressBook(send_legacy));
+    QVERIFY(wallet->SetAddressBook(change_with_data, "frank", wallet::AddressPurpose::RECEIVE));
+    QVERIFY(wallet->SetAddressBook(never, "gina", wallet::AddressPurpose::SEND));
+    QVERIFY(wallet->SetAddressBook(send_blank, "", /*purpose=*/{}));
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
+    if (QTest::currentTestFailed()) return;
+    QCOMPARE(shown_label(change_with_data), QStringLiteral("frank"));
+
+    // Changes made on another thread, as by an RPC, reach it queued.
+    std::thread rpc{[&] {
+        wallet->SetAddressBook(receive_blank, "hank", /*purpose=*/{});
+        wallet->DelAddressBook(send_segwit);
+        wallet->SetAddressBook(removed, "dave2", wallet::AddressPurpose::SEND);
+    }};
+    rpc.join();
+    QCoreApplication::sendPostedEvents();
+    QCOMPARE(shown_label(removed), QStringLiteral("dave2"));
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
+    if (QTest::currentTestFailed()) return;
+
+    // The message signing dialog has the wallet model hand out an address
+    // table model that lists only legacy addresses. The transaction list
+    // keeps showing the labels of the others.
+    wallet_model.refresh(/*pk_hash_only=*/true);
+    AddressTableModel* const legacy_only{wallet_model.getAddressTableModel()};
+    QVERIFY(legacy_only != labels);
+    QCOMPARE(legacy_only->rowCount({}), 1);
+    QCOMPARE(legacy_only->index(0, AddressTableModel::Address, {}).data(Qt::EditRole).toString(), encode(legacy));
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
+    if (QTest::currentTestFailed()) return;
+    QCOMPARE(shown_label(receive_labelled), QStringLiteral("alice2"));
+    QCOMPARE(shown_label(send_p2mr), QStringLiteral("erin"));
+
+    // Both models keep following the address book.
+    QVERIFY(wallet->SetAddressBook(receive_labelled, "alice3", /*purpose=*/{}));
+    QVERIFY(wallet->DelAddressBook(send_p2mr));
+    QVERIFY(wallet->SetAddressBook(legacy, "miner2", /*purpose=*/{}));
+    QVERIFY(wallet->SetAddressBook(send_legacy, "bob2", wallet::AddressPurpose::SEND));
+    const auto listed_label{[&encode](const AddressTableModel& table, const CTxDestination& dest) {
+        const int row{table.lookupAddress(encode(dest))};
+        return row < 0 ? QStringLiteral("(not listed)") : table.index(row, AddressTableModel::Label, {}).data(Qt::EditRole).toString();
+    }};
+    QCOMPARE(legacy_only->rowCount({}), 2);
+    QCOMPARE(listed_label(*legacy_only, legacy), QStringLiteral("miner2"));
+    QCOMPARE(listed_label(*legacy_only, send_legacy), QStringLiteral("bob2"));
+    QCOMPARE(listed_label(*labels, receive_labelled), QStringLiteral("alice3"));
+    QCOMPARE(listed_label(*labels, send_p2mr), QStringLiteral("(not listed)"));
+    QCOMPARE(listed_label(*labels, send_legacy), QStringLiteral("bob2"));
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
+    if (QTest::currentTestFailed()) return;
+    QCOMPARE(shown_label(receive_labelled), QStringLiteral("alice3"));
+    QCOMPARE(shown_label(send_p2mr), QString{});
+
+    // Each time the message signing dialog opens its address book, the wallet
+    // model hands out another model, and nothing shows the one before. Only
+    // the models in use follow the address book, so an address book change
+    // costs the same however often the dialog has opened it.
+    wallet_model.refresh(/*pk_hash_only=*/true);
+    AddressTableModel* const legacy_only_again{wallet_model.getAddressTableModel()};
+    QVERIFY(legacy_only_again != legacy_only);
+    QVERIFY(wallet->SetAddressBook(legacy, "miner3", /*purpose=*/{}));
+    QCOMPARE(listed_label(*legacy_only_again, legacy), QStringLiteral("miner3"));
+    QCOMPARE(listed_label(*labels, legacy), QStringLiteral("miner3"));
+    QCOMPARE(listed_label(*legacy_only, legacy), QStringLiteral("miner2"));
+
+    // Another thread holds the wallet lock, as the wallet does for each block
+    // it connects, until the GUI thread is done. The bound only ends a GUI
+    // thread that waits for the lock, so no pause of the process can fail
+    // the test. Read, paint, filter and sort the list meanwhile.
+    TransactionView& view{mini_gui.transactionView};
+    view.resize(1000, 600);
+    TransactionFilterProxy* const proxy{view.findChild<TransactionFilterProxy*>()};
+    QTableView* const list{view.findChild<QTableView*>()};
+    QVERIFY(proxy);
+    QVERIFY(list);
+    std::mutex hold_mutex;
+    std::condition_variable hold_cv;
+    bool held{false};
+    bool gui_done{false};
+    bool holder_timed_out{false};
+    std::thread holder{[&] {
+        LOCK(wallet->cs_wallet);
+        std::unique_lock lock{hold_mutex};
+        held = true;
+        hold_cv.notify_all();
+        holder_timed_out = !hold_cv.wait_for(lock, std::chrono::seconds{60}, [&gui_done] { return gui_done; });
+    }};
+    const auto finish{[&] {
+        {
+            std::lock_guard lock{hold_mutex};
+            gui_done = true;
+        }
+        hold_cv.notify_all();
+    }};
+    const JoinOnExit join_holder{holder};
+    const RunOnExit finish_on_exit{finish};
+    {
+        std::unique_lock lock{hold_mutex};
+        QVERIFY(hold_cv.wait_for(lock, std::chrono::seconds{60}, [&held] { return held; }));
+    }
+    for (int row = 0; row < transactions->rowCount({}); ++row) {
+        const QModelIndex index{transactions->index(row, TransactionTableModel::ToAddress)};
+        index.data(TransactionTableModel::LabelRole);
+        index.data(Qt::DisplayRole);
+        index.data(Qt::ForegroundRole);
+        index.data(Qt::ToolTipRole);
+    }
+    view.grab();
+    proxy->setSearchString(QStringLiteral("alice3"));
+    const int found{proxy->rowCount({})};
+    proxy->setSearchString(QString{});
+    list->sortByColumn(TransactionTableModel::ToAddress, Qt::AscendingOrder);
+    view.grab();
+    finish();
+    holder.join();
+    QVERIFY2(!holder_timed_out, "GUI thread waited for the wallet lock while showing transaction labels");
+    QCOMPARE(found, 1);
+    VerifyLabelsMatchWallet(wallet_model, *labels, addresses);
+}
+
+//! The wallet model registers for address book changes before its address
+//! table model reads the address book. Changes another thread makes while
+//! the models load, which takes seconds for a long history, reach the
+//! transaction list once the constructor has returned, wherever they fall
+//! around that read, and leave each address listed once.
+void TestAddressBookChangesWhileModelLoads(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const auto p2mr{[](uint8_t n) { return CTxDestination{WitnessV2P2MR{uint256{n}}}; }};
+    // Filed before the model registers: in the read only.
+    const CTxDestination before{p2mr(0x51)};
+    // Filed after it registers and before the read: in the read and notified.
+    const CTxDestination during{p2mr(0x52)};
+    // Filed after the read, before the constructor returns.
+    const CTxDestination after{p2mr(0x53)};
+    // Filed and relabelled, or filed and removed, before the read.
+    const CTxDestination relabelled{p2mr(0x54)};
+    const CTxDestination removed{p2mr(0x55)};
+    // Filed before the read, and relabelled or removed after it.
+    const CTxDestination relabelled_later{p2mr(0x56)};
+    const CTxDestination removed_later{p2mr(0x57)};
+    state->address_book.emplace_back(before, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "before");
+    state->wallet_tx = MakeSyntheticPayment({before, during, after, relabelled, removed, relabelled_later, removed_later}, 5);
+
+    const auto change{[&state](const CTxDestination& dest, const std::string& label, ChangeType status) {
+        return SyntheticAddressBookChange(state, dest, label, wallet::AddressPurpose::RECEIVE, status);
+    }};
+    // Make the changes on another thread, as an RPC does while the GUI thread
+    // is inside the constructor. The notifications are only posted: the
+    // constructor does not run the event loop.
+    const auto change_elsewhere{[](std::vector<std::function<void()>> changes) {
+        std::thread thread{[changes] {
+            for (const auto& change : changes) change();
+        }};
+        thread.join();
+    }};
+    {
+        std::lock_guard lock{state->mutex};
+        state->get_addresses_entered = [&] {
+            change_elsewhere({
+                change(during, "during", CT_NEW),
+                change(relabelled, "first", CT_NEW),
+                change(relabelled, "second", CT_UPDATED),
+                change(removed, "gone", CT_NEW),
+                change(removed, "", CT_DELETED),
+                change(relabelled_later, "old", CT_NEW),
+                change(removed_later, "doomed", CT_NEW),
+            });
+        };
+        state->get_addresses_returning = [&] {
+            change_elsewhere({
+                change(after, "after", CT_NEW),
+                change(relabelled_later, "new", CT_UPDATED),
+                change(removed_later, "", CT_DELETED),
+            });
+        };
+    }
+    auto model{env.makeModel(state)};
+    {
+        std::lock_guard lock{state->mutex};
+        state->get_addresses_entered = {};
+        state->get_addresses_returning = {};
+    }
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    QCOMPARE(table->rowCount({}), 7);
+
+    // The constructor has returned with what the read found, and nothing
+    // raised meanwhile has been applied yet.
+    QCOMPARE(addresses->rowCount({}), 5);
+    QCOMPARE(TransactionLabel(*table, 2), QString{});
+    QCOMPARE(TransactionLabel(*table, 5), QStringLiteral("old"));
+
+    QCoreApplication::sendPostedEvents();
+    std::vector<interfaces::WalletAddress> book;
+    {
+        std::lock_guard lock{state->mutex};
+        book = state->address_book;
+    }
+    QCOMPARE(book.size(), size_t{5});
+    QCOMPARE(addresses->rowCount({}), 5);
+    for (const auto& entry : book) {
+        const QString address{QString::fromStdString(EncodeDestination(entry.dest))};
+        QVERIFY2(addresses->lookupAddress(address) >= 0, qPrintable(address));
+        QCOMPARE(addresses->cachedLabelForAddress(address), QString::fromStdString(entry.name));
+    }
+    const std::array<QString, 7> labels{QStringLiteral("before"), QStringLiteral("during"), QStringLiteral("after"),
+                                        QStringLiteral("second"), QString{}, QStringLiteral("new"), QString{}};
+    for (int row = 0; row < 7; ++row) QCOMPARE(TransactionLabel(*table, row), labels[row]);
+
+    // A change raised on the GUI thread reaches the wallet model at once, not
+    // queued. The constructor only reads the wallet, so it raises none; if it
+    // did, during the read, the read would include the change, and the
+    // models still under construction must not apply it a second time.
+    auto gui_state{std::make_shared<qt_test::SyntheticWalletState>()};
+    const CTxDestination from_gui{p2mr(0x58)};
+    gui_state->wallet_tx = MakeSyntheticPayment({from_gui}, 6);
+    {
+        std::lock_guard lock{gui_state->mutex};
+        gui_state->get_addresses_entered = SyntheticAddressBookChange(gui_state, from_gui, "gui", wallet::AddressPurpose::RECEIVE, CT_NEW);
+    }
+    auto gui_model{env.makeModel(gui_state)};
+    {
+        std::lock_guard lock{gui_state->mutex};
+        gui_state->get_addresses_entered = {};
+    }
+    QCoreApplication::sendPostedEvents();
+    QCOMPARE(gui_model->getAddressTableModel()->rowCount({}), 1);
+    QCOMPARE(gui_model->getAddressTableModel()->cachedLabelForAddress(QString::fromStdString(EncodeDestination(from_gui))), QStringLiteral("gui"));
+    QCOMPARE(TransactionLabel(*gui_model->getTransactionTableModel(), 0), QStringLiteral("gui"));
+}
+
 //! BitcoinGUI::updateWalletStatus reads the current wallet whenever any wallet
 //! reports a status change, so another wallet's notification while the
 //! current one is being encrypted must not send the GUI thread into the
@@ -5527,6 +7154,27 @@ void WalletTests::walletTests()
     TestEncryptWalletKeepsGuiResponsive(m_node);
     TestEncryptWalletDefersTransactionUpdates(m_node);
     TestEncryptWalletRepaintUsesCachedLabels(m_node);
+    TestTransactionLabelsSkipWalletLock(m_node);
+    TestTransactionLabelDeliveryOrder(m_node);
+    TestLabelChangeUpdatesItsRows(m_node);
+    TestLabelChangeWaitsForWalletNotification(m_node);
+    TestLabelPassOnlyForLabelChanges(m_node);
+    TestLabelChangeBurstMakesOnePass(m_node);
+    TestLabelChangeSendsOneSignal(m_node);
+    TestLabelPassKeepsRowsAfterRowChange(m_node);
+    TestStoredAddressTextFollowsLabel(m_node);
+    TestUndecodableAddressHasNoLabel(m_node);
+    TestReorderedLabelNotificationsConverge(m_node);
+    TestReorderedAddAndRemoveConverge(m_node);
+    TestAddressBookReconcileWaitsForFreeLock(m_node);
+    TestAddressBookReconcileInOrderChangesNothing(m_node);
+    TestModelDeletedWithAddressBookReconcilePending(m_node);
+    TestAddressBookReconcileKeepsLegacyOnlyModel(m_node);
+    TestAddressBookReconcileSkipsUndecodableEntry(m_node);
+    TestAddressBookReconcileRereadsAfterNestedNotification(m_node);
+    TestAddressBookReconcileWithLegacyOnlyModel(m_node);
+    TestTransactionLabelsMatchWallet(m_node);
+    TestAddressBookChangesWhileModelLoads(m_node);
     TestEncryptWalletOtherWalletStatusChange(m_node);
     TestEncryptWalletFailureReportsError(m_node);
     TestEncryptWalletAlreadyEncryptedByAnotherRequest(m_node);

@@ -291,17 +291,40 @@ public:
         }
         return true;
     }
+    //! An address book entry as getAddresses() and tryGetAddresses() list it.
+    WalletAddress listedAddress(const CTxDestination& dest, const std::string& label, const std::optional<AddressPurpose>& purpose) EXCLUSIVE_LOCKS_REQUIRED(m_wallet->cs_wallet)
+    {
+        bool is_mine = m_wallet->IsMine(dest);
+        // In very old wallets, address purpose may not be recorded so we derive it from IsMine
+        return {dest, is_mine, purpose.value_or(is_mine ? AddressPurpose::RECEIVE : AddressPurpose::SEND), label};
+    }
     std::vector<WalletAddress> getAddresses() override
     {
         LOCK(m_wallet->cs_wallet);
         std::vector<WalletAddress> result;
         m_wallet->ForEachAddrBookEntry([&](const CTxDestination& dest, const std::string& label, bool is_change, const std::optional<AddressPurpose>& purpose) EXCLUSIVE_LOCKS_REQUIRED(m_wallet->cs_wallet) {
             if (is_change) return;
-            bool is_mine = m_wallet->IsMine(dest);
-            // In very old wallets, address purpose may not be recorded so we derive it from IsMine
-            result.emplace_back(dest, is_mine, purpose.value_or(is_mine ? AddressPurpose::RECEIVE : AddressPurpose::SEND), label);
+            result.push_back(listedAddress(dest, label, purpose));
         });
         return result;
+    }
+    bool tryGetAddresses(const std::vector<CTxDestination>& dests, std::vector<std::optional<WalletAddress>>& entries) override
+    {
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet) {
+            return false;
+        }
+        entries.clear();
+        entries.reserve(dests.size());
+        for (const CTxDestination& dest : dests) {
+            const CAddressBookData* entry{m_wallet->FindAddressBookEntry(dest, /*allow_change=*/false)};
+            if (!entry) {
+                entries.emplace_back();
+                continue;
+            }
+            entries.emplace_back(listedAddress(dest, entry->GetLabel(), entry->purpose));
+        }
+        return true;
     }
     std::vector<OutputType> getAvailableAddressTypes() override
     {

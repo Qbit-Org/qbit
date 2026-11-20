@@ -91,6 +91,27 @@ struct SyntheticWalletState {
     //! The address book, returned by getAddresses() and searched by
     //! getAddress(). Both wait on the encryption latch.
     std::vector<interfaces::WalletAddress> address_book;
+    //! Called by getAddresses() before and after it reads address_book, so
+    //! a test can change the address book around that read.
+    std::function<void()> get_addresses_entered;
+    std::function<void()> get_addresses_returning;
+    //! Number of getAddress() calls, counted before the call waits, with
+    //! condition notified so a test can see the call.
+    int get_address_calls{0};
+    //! Number of tryGetAddresses() calls, which give up instead of waiting.
+    int try_get_addresses_calls{0};
+    //! Listener for the address book notification, so a test can raise it
+    //! the way the wallet does after changing address_book.
+    interfaces::Wallet::AddressBookChangedFn address_book_changed;
+    //! Stand-in for another thread holding the wallet lock, as the wallet
+    //! does while it connects a block: calls that wait on the encryption
+    //! latch also wait while this is set, and tryGetTxStatus() gives up.
+    bool wallet_lock_held{false};
+    //! The thread holding it, if a test sets one. As cs_wallet is a
+    //! recursive mutex, that thread's own calls neither wait nor give up.
+    std::thread::id wallet_lock_owner;
+    //! Whether the lock stand-in keeps the calling thread out.
+    bool WalletLockExcludesCaller() const { return wallet_lock_held && wallet_lock_owner != std::this_thread::get_id(); }
     bool psbt_sign_entered{false};
     bool allow_psbt_reservation{true};
     bool allow_psbt_completion{true};

@@ -17,11 +17,17 @@
 
 #include <core_io.h>
 #include <interfaces/handler.h>
+#include <key_io.h>
 #include <tinyformat.h>
 #include <uint256.h>
+#include <util/check.h>
+#include <util/string.h>
 
 #include <algorithm>
 #include <functional>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include <QColor>
 #include <QDateTime>
@@ -247,13 +253,16 @@ public:
     }
 };
 
-TransactionTableModel::TransactionTableModel(const PlatformStyle *_platformStyle, WalletModel *parent):
+TransactionTableModel::TransactionTableModel(const PlatformStyle *_platformStyle, AddressTableModel *address_table_model, WalletModel *parent):
         QAbstractTableModel(parent),
         walletModel(parent),
+        m_address_table_model(Assert(address_table_model)),
         priv(new TransactionTablePriv(this)),
         platformStyle(_platformStyle)
 {
     subscribeToCoreSignals();
+    connect(this, &QAbstractItemModel::rowsInserted, this, [this] { ++m_row_changes; });
+    connect(this, &QAbstractItemModel::rowsRemoved, this, [this] { ++m_row_changes; });
 
     columns << QString() << tr("Date") << tr("Type") << tr("Label") << QbitUnits::getAmountColumnTitle(walletModel->getOptionsModel()->getDisplayUnit());
     priv->refreshWallet(walletModel->wallet());
@@ -385,7 +394,7 @@ QString TransactionTableModel::formatTxDate(const TransactionRecord *wtx) const
  */
 QString TransactionTableModel::lookupAddress(const std::string &address, bool tooltip) const
 {
-    QString label = walletModel->getAddressTableModel()->labelForAddress(QString::fromStdString(address));
+    QString label = m_address_table_model->cachedLabelForAddress(QString::fromStdString(address));
     QString description;
     if(!label.isEmpty())
     {
@@ -396,6 +405,86 @@ QString TransactionTableModel::lookupAddress(const std::string &address, bool to
         description += QString(" (") + QString::fromStdString(address) + QString(")");
     }
     return description;
+}
+
+/* Whether a row whose address is row_address shows the label of one of the
+   encoded addresses in changed. Labels are looked up by the row address
+   decoded and encoded again, which gives the row address back when it was
+   encoded from an output. An address the wallet stored as text
+   (RecvFromOther, SendToOther and their coinbase form) can decode to
+   another spelling only when it has surrounding white space or no lower
+   case letter, as a bech32 address in upper case, so only such a spelling
+   needs decoding to compare. */
+static bool ShowsChangedLabel(const std::string& row_address, const std::unordered_set<std::string>& changed)
+{
+    if (changed.count(row_address)) return true;
+    if (util::TrimStringView(row_address).size() == row_address.size() &&
+        std::any_of(row_address.begin(), row_address.end(), [](char c) { return c >= 'a' && c <= 'z'; })) {
+        return false;
+    }
+    const CTxDestination destination{DecodeDestination(row_address)};
+    return IsValidDestination(destination) && changed.count(EncodeDestination(destination));
+}
+
+void TransactionTableModel::updateAddressLabel(const QString &address)
+{
+    // Rows read their labels from the address table model, not from the
+    // wallet, so nothing reads a changed label again unless told to. Finding
+    // the rows that show the address takes a pass over the whole history,
+    // and notifying them makes every proxy filter and sort them again, which
+    // reads their status. Do neither inside the wallet's notification: for a
+    // change made on this thread, CWallet::DelAddressBook (inside a database
+    // transaction) and CWallet::GetNewDestination notify with cs_wallet held,
+    // so every other thread that needs the wallet would wait. Make one pass
+    // for all the addresses changed until the event loop runs it.
+    m_changed_labels.insert(address.toStdString());
+    queueLabelPass();
+}
+
+void TransactionTableModel::queueLabelPass()
+{
+    if (m_label_pass_queued) return;
+    m_label_pass_queued = true;
+    QMetaObject::invokeMethod(this, [this] { updateChangedLabels(); }, Qt::QueuedConnection);
+}
+
+void TransactionTableModel::updateChangedLabels()
+{
+    m_label_pass_queued = false;
+    std::unordered_set<std::string> changed;
+    changed.swap(m_changed_labels);
+    if (changed.empty()) return;
+    ++m_label_passes;
+
+    int first{-1};
+    int last{-1};
+    for (int row = 0; row < priv->size(); ++row) {
+        if (!ShowsChangedLabel(priv->cachedWallet.at(row).address, changed)) continue;
+        if (first < 0) first = row;
+        last = row;
+    }
+    if (first < 0) return;
+    // Send one signal, from the first to the last row that shows a changed
+    // label. A proxy sorts the rows of a signal again among its other rows,
+    // which it takes to be in order. The rows of one address are scattered,
+    // as rows are ordered by transaction, and all their labels have already
+    // changed, so a proxy sorted on the address column only places them
+    // right if they all come in one signal. A proxy filters every row a
+    // signal covers, whatever its columns, which costs no more than a change
+    // of its search text, but sorts them again only if they include its sort
+    // column. Only the address column shows the label, in its text, colour
+    // and sort key, and the label role is the same for every column, so a
+    // list sorted by date is left as it is.
+    QPointer<TransactionTableModel> model{this};
+    const uint64_t row_changes{m_row_changes};
+    Q_EMIT dataChanged(index(first, ToAddress), index(last, ToAddress));
+    // A listener may run a nested event loop that deletes this model, or
+    // that adds or removes rows, so that the listeners after it got row
+    // numbers that no longer hold. Then notify the rows again.
+    if (model && m_row_changes != row_changes) {
+        m_changed_labels.insert(changed.begin(), changed.end());
+        queueLabelPass();
+    }
 }
 
 QString TransactionTableModel::formatTxType(const TransactionRecord *wtx) const
@@ -461,7 +550,7 @@ QVariant TransactionTableModel::addressColor(const TransactionRecord *wtx) const
     case TransactionRecord::SendToAddress:
     case TransactionRecord::Generated:
         {
-        QString label = walletModel->getAddressTableModel()->labelForAddress(QString::fromStdString(wtx->address));
+        QString label = m_address_table_model->cachedLabelForAddress(QString::fromStdString(wtx->address));
         if(label.isEmpty())
             return COLOR_BAREADDRESS;
         } break;
@@ -613,7 +702,7 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
     case AddressRole:
         return QString::fromStdString(rec->address);
     case LabelRole:
-        return walletModel->getAddressTableModel()->labelForAddress(QString::fromStdString(rec->address));
+        return m_address_table_model->cachedLabelForAddress(QString::fromStdString(rec->address));
     case AmountRole:
         return qint64(rec->credit + rec->debit);
     case TxHashRole:
@@ -624,7 +713,7 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
         {
             QString details;
             QDateTime date = QDateTime::fromSecsSinceEpoch(rec->time);
-            QString txLabel = walletModel->getAddressTableModel()->labelForAddress(QString::fromStdString(rec->address));
+            QString txLabel = m_address_table_model->cachedLabelForAddress(QString::fromStdString(rec->address));
 
             details.append(date.toString("M/d/yy HH:mm"));
             details.append(" ");

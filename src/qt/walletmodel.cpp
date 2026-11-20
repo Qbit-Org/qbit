@@ -23,6 +23,7 @@
 #include <node/interface_ui.h>
 #include <node/types.h>
 #include <psbt.h>
+#include <util/check.h>
 #include <util/signing_timing.h>
 #include <util/time.h>
 #include <util/translation.h>
@@ -35,6 +36,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <QDateTime>
@@ -73,6 +75,10 @@ struct WalletModel::BumpFeeProgress {
     unsigned int total{0};
 };
 
+static void NotifyAddressBookChanged(WalletModel *walletmodel,
+        const CTxDestination &address, const std::string &label, bool isMine,
+        wallet::AddressPurpose purpose, ChangeType status);
+
 WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle *platformStyle, QObject *parent) :
     QObject(parent),
     m_wallet(std::move(wallet)),
@@ -89,8 +95,18 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     m_last_encryption_status = readEncryptionStatus();
     m_last_pqc_key_validation_info = m_wallet->getPQCKeyValidationInfo();
 
+    // Register for address book changes before the address table model
+    // reads the address book, which the transaction list shows labels from.
+    // A change another thread makes while the models load is then queued, as
+    // this model lives on this thread, and applied once this constructor has
+    // returned, instead of being lost; one the read already includes is
+    // skipped, or applied again with the state it already has. A change made
+    // on this thread would be applied at once, but the constructor only
+    // reads the wallet. The other handlers follow in subscribeToCoreSignals().
+    m_handler_address_book_changed = m_wallet->handleAddressBookChanged(std::bind(NotifyAddressBookChanged, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
     addressTableModel = new AddressTableModel(this);
-    transactionTableModel = new TransactionTableModel(platformStyle, this);
+    m_complete_address_table_model = addressTableModel;
+    transactionTableModel = new TransactionTableModel(platformStyle, m_complete_address_table_model, this);
     recentRequestsTableModel = new RecentRequestsTableModel(this);
 
     subscribeToCoreSignals();
@@ -201,8 +217,123 @@ void WalletModel::updateTransaction()
 void WalletModel::updateAddressBook(const QString &address, const QString &label,
         bool isMine, wallet::AddressPurpose purpose, int status)
 {
-    if(addressTableModel)
-        addressTableModel->updateEntry(address, label, isMine, purpose, status);
+    // Before the constructor has created the models, which read the address
+    // book, there is nothing to update.
+    if (!m_complete_address_table_model) return;
+    ++m_address_book_notifications;
+    QPointer<WalletModel> model{this};
+    applyAddressBookChange(address, label, isMine, purpose, status);
+    if (!model) return;
+    // Notifications can arrive in another order than the writes they report:
+    // CWallet::SetAddressBookWithDB notifies after releasing cs_wallet, so of
+    // two writers to one entry the first to write can be the last to notify,
+    // and the models would keep its label. Compare the entry with the wallet
+    // once the event loop runs. Each notification is followed by such a
+    // comparison, so the models end at the wallet's state.
+    m_unreconciled_addresses.insert(address);
+    queueAddressBookReconcile();
+}
+
+void WalletModel::applyAddressBookChange(const QString& address, const QString& label,
+        bool isMine, wallet::AddressPurpose purpose, int status)
+{
+    // The address book pages and the transaction list keep the complete
+    // address table model, and the transaction list shows its labels.
+    // refresh() may since have handed out another one, which the dialog that
+    // asked for it shows; nothing shows those it handed out before. Update
+    // the two in use, then have the transaction list notify the rows that
+    // show this address, which it does once this call has returned.
+    // Listeners may run nested event loops that delete this model, so check
+    // it after each.
+    //
+    // The transaction list shows nothing of an entry but its label, so skip
+    // its pass over the history when the label stays as it was, as for the
+    // unlabelled receiving entry the wallet files for each address it finds
+    // used while it connects blocks or rescans, a change of purpose only, or
+    // the removal of an unlabelled entry.
+    QPointer<WalletModel> model{this};
+    const QString shown{m_complete_address_table_model->cachedLabelForAddress(address)};
+    m_complete_address_table_model->updateEntry(address, label, isMine, purpose, status);
+    if (!model) return;
+    if (addressTableModel && addressTableModel != m_complete_address_table_model) addressTableModel->updateEntry(address, label, isMine, purpose, status);
+    if (!model) return;
+    if (transactionTableModel && m_complete_address_table_model->cachedLabelForAddress(address) != shown) {
+        transactionTableModel->updateAddressLabel(address);
+    }
+}
+
+void WalletModel::queueAddressBookReconcile()
+{
+    // One queued call at a time, and none while the retry timer waits for
+    // the wallet lock: it covers every address recorded until it fires.
+    if (m_address_book_reconcile_queued || (m_address_book_retry_timer && m_address_book_retry_timer->isActive())) return;
+    m_address_book_reconcile_queued = true;
+    QMetaObject::invokeMethod(this, [this] { reconcileAddressBook(); }, Qt::QueuedConnection);
+}
+
+void WalletModel::reconcileAddressBook()
+{
+    m_address_book_reconcile_queued = false;
+    // An entry the wallet holds under a destination its encoding does not
+    // name, such as one that encodes to the empty string, or an address this
+    // chain does not decode, cannot be looked up by that encoding: the read
+    // would find no entry and remove the row. Leave such a row as its
+    // notifications left it.
+    std::vector<QString> addresses;
+    std::vector<CTxDestination> destinations;
+    for (auto it{m_unreconciled_addresses.begin()}; it != m_unreconciled_addresses.end();) {
+        CTxDestination destination{DecodeDestination(it->toStdString())};
+        if (!IsValidDestination(destination)) {
+            it = m_unreconciled_addresses.erase(it);
+            continue;
+        }
+        addresses.push_back(*it);
+        destinations.push_back(std::move(destination));
+        ++it;
+    }
+    if (addresses.empty()) return;
+    // Never wait for the wallet lock on this thread. While it is busy, as
+    // while the wallet connects a block or is being encrypted, keep the
+    // addresses and try again later.
+    std::vector<std::optional<interfaces::WalletAddress>> entries;
+    if (!m_wallet->tryGetAddresses(destinations, entries)) {
+        if (!m_address_book_retry_timer) {
+            m_address_book_retry_timer = new QTimer(this);
+            m_address_book_retry_timer->setObjectName(QStringLiteral("addressBookRetryTimer"));
+            m_address_book_retry_timer->setSingleShot(true);
+            m_address_book_retry_timer->setInterval(MODEL_UPDATE_DELAY);
+            connect(m_address_book_retry_timer, &QTimer::timeout, this, &WalletModel::reconcileAddressBook);
+        }
+        m_address_book_retry_timer->start();
+        return;
+    }
+    m_unreconciled_addresses.clear();
+    if (!Assume(entries.size() == addresses.size())) return;
+    // Bring each row that differs from the wallet's entry to it, as a
+    // notification of that entry would. A model the message signing dialog
+    // was handed gets the same change, so it takes in no entry that a
+    // notification would not give it.
+    QPointer<WalletModel> model{this};
+    for (size_t i = 0; i < addresses.size(); ++i) {
+        const interfaces::WalletAddress* const entry{entries[i] ? &*entries[i] : nullptr};
+        const std::optional<int> change{m_complete_address_table_model->changeToEntry(addresses[i], entry)};
+        if (!change) continue;
+        const uint64_t notifications{m_address_book_notifications};
+        if (entry) {
+            applyAddressBookChange(addresses[i], QString::fromStdString(entry->name), entry->is_mine, entry->purpose, *change);
+        } else {
+            applyAddressBookChange(addresses[i], QString{}, /*isMine=*/false, wallet::AddressPurpose::SEND, *change);
+        }
+        if (!model) return;
+        // A listener may run a nested event loop that delivers a newer
+        // notification, which the entries read above for the addresses still
+        // to come may predate. Read those again instead of applying them.
+        if (m_address_book_notifications != notifications) {
+            for (size_t later = i + 1; later < addresses.size(); ++later) m_unreconciled_addresses.insert(addresses[later]);
+            queueAddressBookReconcile();
+            return;
+        }
+    }
 }
 
 void WalletModel::updateCanGetAddresses()
@@ -746,7 +877,7 @@ void WalletModel::subscribeToCoreSignals()
     // Connect signals to wallet
     m_handler_unload = m_wallet->handleUnload(std::bind(&NotifyUnload, this));
     m_handler_status_changed = m_wallet->handleStatusChanged(std::bind(&NotifyKeyStoreStatusChanged, this));
-    m_handler_address_book_changed = m_wallet->handleAddressBookChanged(std::bind(NotifyAddressBookChanged, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
+    // The constructor has registered m_handler_address_book_changed.
     m_handler_transaction_changed = m_wallet->handleTransactionChanged(std::bind(NotifyTransactionChanged, this, std::placeholders::_1, std::placeholders::_2));
     m_handler_show_progress = m_wallet->handleShowProgress(std::bind(ShowProgress, this, std::placeholders::_1, std::placeholders::_2));
     m_handler_can_get_addrs_changed = m_wallet->handleCanGetAddressesChanged(std::bind(NotifyCanGetAddressesChanged, this));

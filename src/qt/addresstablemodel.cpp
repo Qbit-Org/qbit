@@ -7,6 +7,7 @@
 #include <qt/guiutil.h>
 #include <qt/walletmodel.h>
 
+#include <interfaces/wallet.h>
 #include <key_io.h>
 #include <wallet/types.h>
 #include <wallet/wallet.h>
@@ -168,6 +169,16 @@ public:
             cachedAddressTable.begin(), cachedAddressTable.end(), address, AddressTableEntryLessThan());
         if (it == cachedAddressTable.end() || it->address != address) return nullptr;
         return &*it;
+    }
+
+    /* Find the entry for a destination, encoded as the rows are. The wallet
+       has no entry for a destination that is not valid, such as an address
+       that does not decode, so neither does this, even if a row's encoding
+       is the empty string that such a destination encodes to. */
+    const AddressTableEntry* find(const CTxDestination& dest) const
+    {
+        if (!IsValidDestination(dest)) return nullptr;
+        return find(QString::fromStdString(EncodeDestination(dest)));
     }
 
     AddressTableEntry *index(int idx)
@@ -438,6 +449,23 @@ QString AddressTableModel::labelForAddress(const QString &address) const
     return QString();
 }
 
+QString AddressTableModel::cachedLabelForAddress(const QString &address) const
+{
+    // Decode the address as getAddressData() does, so that a non-canonical
+    // or invalid string finds the entry the wallet would find.
+    const AddressTableEntry* entry = priv->find(DecodeDestination(address.toStdString()));
+    return entry ? entry->label : QString();
+}
+
+std::optional<int> AddressTableModel::changeToEntry(const QString &address, const interfaces::WalletAddress* entry) const
+{
+    const AddressTableEntry* row = priv->find(address);
+    if (!entry) return row ? std::optional<int>{CT_DELETED} : std::nullopt;
+    if (!row) return CT_NEW;
+    if (row->label == QString::fromStdString(entry->name) && row->type == translateTransactionType(entry->purpose, entry->is_mine)) return std::nullopt;
+    return CT_UPDATED;
+}
+
 std::optional<wallet::AddressPurpose> AddressTableModel::purposeForAddress(const QString &address) const
 {
     wallet::AddressPurpose purpose;
@@ -453,10 +481,10 @@ bool AddressTableModel::getAddressData(const QString &address,
     CTxDestination destination = DecodeDestination(address.toStdString());
     // The wallet blocks while an encryption holds its locks, whoever started
     // it, and the address book cannot change until it returns, so answer from
-    // the rows this model already holds. A repaint of the transaction list
-    // looks up its labels here without any user input.
+    // the rows this model already holds. The dialogs that look up a label
+    // or a purpose here would otherwise wait until the encryption ends.
     if (walletModel->isEncryptingWallet()) {
-        const AddressTableEntry* entry = priv->find(QString::fromStdString(EncodeDestination(destination)));
+        const AddressTableEntry* entry = priv->find(destination);
         if (!entry) return false;
         if (name) *name = entry->label.toStdString();
         if (purpose) *purpose = translateAddressPurpose(entry->type);

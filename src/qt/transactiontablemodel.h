@@ -10,14 +10,18 @@
 #include <QAbstractTableModel>
 #include <QStringList>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace interfaces {
 class Handler;
 }
 
+class AddressTableModel;
 class PlatformStyle;
 class TransactionRecord;
 class TransactionTablePriv;
@@ -30,7 +34,9 @@ class TransactionTableModel : public QAbstractTableModel
     Q_OBJECT
 
 public:
-    explicit TransactionTableModel(const PlatformStyle *platformStyle, WalletModel *parent = nullptr);
+    /** The rows show labels from address_table_model, which must list every
+        address: the wallet model passes the one it keeps complete. */
+    explicit TransactionTableModel(const PlatformStyle *platformStyle, AddressTableModel *address_table_model, WalletModel *parent = nullptr);
     ~TransactionTableModel();
 
     enum ColumnIndex {
@@ -83,9 +89,28 @@ public:
         being encrypted. Called by the wallet model once the encryption has
         released the wallet, whoever started it. */
     void deliverDeferredUpdates();
+    /** The address book entry for an encoded address was added, changed or
+        removed. Rows show labels from an address table model, so views are
+        notified of the rows that show this address, in one signal for the
+        address column from the first such row to the last. That happens in
+        one pass for every address changed meanwhile, once control has
+        returned to the event loop: this is called from inside the wallet's
+        notification, which for a change made on this thread can still hold
+        the wallet lock (CWallet::DelAddressBook and
+        CWallet::GetNewDestination notify with cs_wallet held, the deletion
+        inside a database transaction). Called by the wallet model once its
+        address table models have the update, if it changed the label. */
+    void updateAddressLabel(const QString &address);
+    /** Number of label passes over the rows so far, for tests. */
+    uint64_t labelPassCount() const { return m_label_passes; }
 
 private:
     WalletModel *walletModel;
+    /** The address table model the rows read their labels from, which lists
+        every address. The wallet model keeps it current, also after
+        WalletModel::refresh() has handed out one that lists only legacy
+        addresses. */
+    AddressTableModel* const m_address_table_model;
     std::unique_ptr<interfaces::Handler> m_handler_transaction_changed;
     std::unique_ptr<interfaces::Handler> m_handler_show_progress;
     QStringList columns;
@@ -96,6 +121,14 @@ private:
         the wallet, which blocks while the encryption holds its locks,
         so they wait here for deliverDeferredUpdates(). */
     std::vector<std::function<void()>> m_deferred_updates;
+    /** Encoded addresses whose address book entry changed since the last
+        label pass, and whether the next pass is queued. */
+    std::unordered_set<std::string> m_changed_labels;
+    bool m_label_pass_queued{false};
+    uint64_t m_label_passes{0};
+    /** Counts insertions and removals of rows, so that a label pass whose
+        listeners change the rows can tell that its row numbers are stale. */
+    uint64_t m_row_changes{0};
     const PlatformStyle *platformStyle;
 
     void subscribeToCoreSignals();
@@ -111,6 +144,8 @@ private:
     QString formatTooltip(const TransactionRecord *rec) const;
     QVariant txStatusDecoration(const TransactionRecord *wtx) const;
     QVariant txAddressDecoration(const TransactionRecord *wtx) const;
+    void queueLabelPass();
+    void updateChangedLabels();
 
 public Q_SLOTS:
     /* New transaction, or transaction changed status */

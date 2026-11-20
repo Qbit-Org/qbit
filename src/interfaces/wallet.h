@@ -151,6 +151,12 @@ public:
     //! Get wallet address list.
     virtual std::vector<WalletAddress> getAddresses() = 0;
 
+    //! Get the address book entries for dests, as getAddresses() lists them,
+    //! if the wallet lock is free. entries[i] is the entry for dests[i], or
+    //! std::nullopt if the wallet has no such entry other than a change one.
+    //! Returns false, and leaves entries alone, if the lock is busy.
+    virtual bool tryGetAddresses(const std::vector<CTxDestination>& dests, std::vector<std::optional<WalletAddress>>& entries) = 0;
+
     //! Get output types the wallet can hand out as receive addresses.
     virtual std::vector<OutputType> getAvailableAddressTypes() = 0;
 
