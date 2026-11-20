@@ -6,10 +6,14 @@
 - Start a node, generate blocks, then restart with -reindex after setting blk files to read-only
 """
 
+from contextlib import ExitStack
+import errno
 import os
+import platform
+import shutil
 import stat
 import subprocess
-from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_framework import BitcoinTestFramework, SkipTest
 
 
 class BlockstoreReindexTest(BitcoinTestFramework):
@@ -32,55 +36,48 @@ class BlockstoreReindexTest(BitcoinTestFramework):
 
         self.log.debug("Make the first block file read-only")
         filename = self.nodes[0].chain_path / "blocks" / "blk00000.dat"
-        filename.chmod(stat.S_IREAD)
+        with ExitStack() as cleanup:
+            mode = filename.stat().st_mode
+            filename.chmod(stat.S_IREAD)
+            cleanup.callback(filename.chmod, mode)
+            linux = platform.system() == "Linux"
+            tool, enable, disable = ("chattr", "+i", "-i") if linux else ("chflags", "uchg", "nouchg")
+            if shutil.which(tool):
+                result = subprocess.run([tool, enable, filename], capture_output=True, text=True)
+                if result.returncode == 0:
+                    cleanup.callback(subprocess.check_call, [tool, disable, filename])
+                    self.log.info(f"Made file immutable with {tool}")
+                else:
+                    self.log.info(f"{tool} failed: {result.stderr.strip()}")
 
-        undo_immutable = lambda: None
-        # Linux
-        try:
-            subprocess.run(['chattr'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            try:
-                subprocess.run(['chattr', '+i', filename], capture_output=True, check=True)
-                undo_immutable = lambda: subprocess.check_call(['chattr', '-i', filename])
-                self.log.info("Made file immutable with chattr")
-            except subprocess.CalledProcessError as e:
-                self.log.warning(str(e))
-                if e.stdout:
-                    self.log.warning(f"stdout: {e.stdout}")
-                if e.stderr:
-                    self.log.warning(f"stderr: {e.stderr}")
-                if os.getuid() == 0:
-                    self.log.warning("Return early on Linux under root, because chattr failed.")
-                    self.log.warning("This should only happen due to missing capabilities in a container.")
-                    self.log.warning("Make sure to --cap-add LINUX_IMMUTABLE if you want to run this test.")
-                    undo_immutable = False
-        except Exception:
-            # macOS, and *BSD
-            try:
-                subprocess.run(['chflags'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            def writable():
+                # The node inherits our credentials. Probe without truncating or modifying the file.
                 try:
-                    subprocess.run(['chflags', 'uchg', filename], capture_output=True, check=True)
-                    undo_immutable = lambda: subprocess.check_call(['chflags', 'nouchg', filename])
-                    self.log.info("Made file immutable with chflags")
-                except subprocess.CalledProcessError as e:
-                    self.log.warning(str(e))
-                    if e.stdout:
-                        self.log.warning(f"stdout: {e.stdout}")
-                    if e.stderr:
-                        self.log.warning(f"stderr: {e.stderr}")
-                    if os.getuid() == 0:
-                        self.log.warning("Return early on BSD under root, because chflags failed.")
-                        undo_immutable = False
-            except Exception:
-                pass
+                    fd = os.open(filename, os.O_WRONLY)
+                except OSError as e:
+                    if e.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+                        return False
+                    raise
+                os.close(fd)
+                return True
 
-        if undo_immutable:
+            if writable():
+                if linux and os.geteuid() == 0 and shutil.which("mount") and shutil.which("umount"):
+                    for options in ("bind", "remount,bind,ro"):
+                        result = subprocess.run(["mount", "-o", options, filename, filename], capture_output=True, text=True)
+                        if result.returncode:
+                            raise SkipTest(f"Block file is writable and {options} mount failed: {result.stderr.strip()}")
+                        if options == "bind":
+                            cleanup.callback(subprocess.check_call, ["umount", filename])
+                    self.log.info("Made block file read-only with a bind mount")
+                    assert not writable(), "Block file is still writable after read-only remount"
+                else:
+                    raise SkipTest("Cannot make the block file read-only for the node")
+
             self.log.debug("Attempt to restart and reindex the node with the unwritable block file")
             with self.nodes[0].assert_debug_log(["Reindexing finished"], timeout=60):
                 self.start_node(0, extra_args=['-reindex', '-fastprune'])
             assert block_count == self.nodes[0].getblockcount()
-            undo_immutable()
-
-        filename.chmod(0o777)
 
     def run_test(self):
         self.reindex_readonly()

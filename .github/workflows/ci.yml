@@ -833,6 +833,8 @@ jobs:
     runs-on: *qbit_runs_on
     if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     timeout-minutes: ${{ matrix.timeout-minutes }}
+    outputs:
+      hosted-tracing: ${{ steps.bpfcc.outputs.hosted-tracing }}
 
     env:
       DANGER_CI_ON_HOST_FOLDERS: 1
@@ -976,10 +978,17 @@ jobs:
           cache-provider: ${{ matrix.provider || needs.runners.outputs.provider }}
 
       - name: Enable bpfcc script
+        id: bpfcc
         if: ${{ env.CONTAINER_NAME == 'ci_native_asan' }}
         # In the image build step, no external environment variables are available,
         # so any settings will need to be written to the settings env file:
-        run: sed -i "s|\${INSTALL_BCC_TRACING_TOOLS}|true|g" ./ci/test/00_setup_env_native_asan.sh
+        run: |
+          if [[ "${QBIT_RUNNER_ISOLATED:-}" == 1 ]]; then
+            echo "Skipping BCC tools on the isolated runner; tracing will run on ubuntu-24.04."
+            echo "hosted-tracing=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sed -i "s|\${INSTALL_BCC_TRACING_TOOLS}|true|g" ./ci/test/00_setup_env_native_asan.sh
 
       - name: Set mmap_rnd_bits
         if: ${{ env.CONTAINER_NAME == 'ci_native_tsan' || startsWith(env.CONTAINER_NAME, 'ci_native_msan') }}
@@ -987,14 +996,22 @@ jobs:
         # Some runners block sysctl writes but already have a compliant value.
         run: |
           REQUIRED=28
-          CURRENT=$(cat /proc/sys/vm/mmap_rnd_bits 2>/dev/null) || true
+          readable=true
+          CURRENT=$(cat /proc/sys/vm/mmap_rnd_bits 2>/dev/null) || readable=false
           echo "vm.mmap_rnd_bits: current=${CURRENT:-unknown}, required<=${REQUIRED}"
-          if [ -n "$CURRENT" ] && [ "$CURRENT" -le "$REQUIRED" ]; then
+          if [[ "$readable" == true && -n "$CURRENT" ]] && [ "$CURRENT" -le "$REQUIRED" ]; then
             echo "PASS: value is already compliant ($CURRENT <= $REQUIRED), no write needed."
             exit 0
           fi
-          if sudo sysctl -w vm.mmap_rnd_bits=$REQUIRED; then
+          # procps can exit zero with a warning when procfs is read-only.
+          if diagnostic=$(sudo sysctl -q -w vm.mmap_rnd_bits=$REQUIRED 2>&1) && [[ -z "$diagnostic" ]]; then
             echo "PASS: successfully set vm.mmap_rnd_bits=$REQUIRED."
+            exit 0
+          fi
+          echo "sysctl write failed: ${diagnostic:-no diagnostic}"
+          ATTESTED=${QBIT_RUNNER_MMAP_RND_BITS:-}
+          if [[ "$readable" == false && ${QBIT_RUNNER_ISOLATED:-} == 1 && "$ATTESTED" =~ ^[0-9]+$ ]] && [ "$ATTESTED" -le "$REQUIRED" ]; then
+            echo "PASS: procfs unreadable and sysctl denied; trusting runner QBIT_RUNNER_MMAP_RND_BITS=$ATTESTED."
             exit 0
           fi
           echo "FAIL: vm.mmap_rnd_bits=${CURRENT:-unknown} is too high and could not be lowered to $REQUIRED."
@@ -1223,6 +1240,30 @@ jobs:
         run: |
           echo "::error title=Full Validation blocked::Fork pull requests into main must have the ci:qbit-trusted label before self-hosted validation jobs can run."
           exit 1
+
+      - name: Check out source for hosted tracing tests
+        if: &hosted_tracing ${{ needs.ci-matrix.outputs.hosted-tracing == 'true' }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: *CHECKOUT_REF_TMPL
+
+      - name: Require USDT and read-only reindex coverage
+        if: *hosted_tracing
+        timeout-minutes: 60
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libboost-dev libevent-dev libsqlite3-dev systemtap-sdt-dev python3-bpfcc "linux-headers-$(uname -r)"
+          # Keep probe arguments in registers so BCC can decode them directly.
+          CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS=-DSTAP_SDT_ARG_CONSTRAINT=r -DWITH_USDT=ON -DENABLE_IPC=OFF -DBUILD_TESTS=OFF
+          cmake --build build --target qbitd qbit-cli -j"$(nproc)"
+
+          mountpoint -q /sys/kernel/tracing || sudo mount -t tracefs tracefs /sys/kernel/tracing
+          # Direct invocation makes a framework skip (exit 77) fail this step.
+          for script in build/test/functional/interface_usdt_*.py; do
+            sudo /usr/bin/python3 "$script"
+          done
+          /usr/bin/python3 build/test/functional/feature_reindex_readonly.py
 
       - name: Check validation results
         env:
