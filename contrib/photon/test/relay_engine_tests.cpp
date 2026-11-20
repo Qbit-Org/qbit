@@ -4,6 +4,7 @@
 #include <peer_manager.h>
 #include <protocol.h>
 #include <relay_engine.h>
+#include <scheduler.h>
 #include <udp_transport.h>
 
 #include <algorithm>
@@ -1407,6 +1408,413 @@ void TestRefusedHeaderRemainingChunksIgnored()
     }
     Require(engine.stats().inbound_rejected == 1, "its chunks should not be counted as further refusals");
     Require(engine.stats().inbound_entries == 0, "its chunks should not be buffered");
+}
+
+// Sends a block's chunks with indices in [from, to), each once.
+void SendChunks(RelayEngine& engine, const InboundPeerInfo& peer, const TestBlock& block, std::size_t from, std::size_t to,
+                CapturingSubmitter& submitter)
+{
+    for (std::size_t i = from; i < std::min(to, block.encoded.chunks.size()); ++i) {
+        engine.OnBlockChunk(peer, BuildChunkPayload(block.encoded.chunks[i], block.prefix), submitter);
+    }
+}
+
+// Sends the data chunks of a block from index `from` on, as DeliverBlock does.
+void SendDataChunks(RelayEngine& engine, const InboundPeerInfo& peer, const TestBlock& block, std::size_t from,
+                    CapturingSubmitter& submitter)
+{
+    for (std::size_t i = from; i < block.encoded.chunks.size(); ++i) {
+        if (block.encoded.chunks[i].chunk_id < block.encoded.params.data_chunks) {
+            engine.OnBlockChunk(peer, BuildChunkPayload(block.encoded.chunks[i], block.prefix), submitter);
+        }
+    }
+}
+
+BlockHeaderPayload HeaderOf(const TestBlock& block)
+{
+    return BuildHeaderPayload(block.encoded, block.prefix, block.bytes.size());
+}
+
+// A block's chunks in the order a sender sends them.
+std::vector<photon::fec::Chunk> SendOrder(const TestBlock& block)
+{
+    std::vector<photon::fec::EncodedBlock> groups{block.encoded};
+    photon::ChunkScheduler scheduler(std::move(groups));
+    std::vector<photon::fec::Chunk> order;
+    while (const auto next = scheduler.Next()) {
+        order.push_back(next->chunk);
+    }
+    Require(order.size() == block.encoded.chunks.size(), "a sender should send every chunk once");
+    return order;
+}
+
+void SendInOrder(RelayEngine& engine, const InboundPeerInfo& peer, const TestBlock& block,
+                 const std::vector<photon::fec::Chunk>& order, std::size_t from, std::size_t to,
+                 CapturingSubmitter& submitter)
+{
+    for (std::size_t i = from; i < std::min(to, order.size()); ++i) {
+        engine.OnBlockChunk(peer, BuildChunkPayload(order[i], block.prefix), submitter);
+    }
+}
+
+// How many of a block's chunks can be lost with every coding group still complete.
+std::size_t ParityChunks(const TestBlock& block)
+{
+    const auto& params = block.encoded.params;
+    return static_cast<std::size_t>(block.encoded.coding_group_count) * (params.total_chunks - params.data_chunks);
+}
+
+void TestCapacityRefusedBlockCompletesInSenderOrder()
+{
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const TestBlock busy = EncodeTestBlock(600'000, 0xF780, params.data_chunks);
+    const TestBlock wanted = EncodeTestBlock(600'000, 0xF781, params.data_chunks);
+    const std::size_t charge = photon::fec::Decoder::MemoryBytes(params, wanted.bytes.size());
+
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_decoder_bytes = charge; // one such decoder in total
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    // Peer 1's block, still receiving chunks, holds all the decoder memory.
+    engine.OnBlockHeader(kPeer1, HeaderOf(busy), submitter);
+    SendChunks(engine, kPeer1, busy, 0, 1, submitter);
+
+    // Peer 0 sends what a sender sends: its three header copies, then each chunk once, in the
+    // sender's order. Until room is free, the block waits: refused once, not the peer's fault,
+    // and nothing displaced for it. It keeps 64 chunks and loses the rest, fewer than its parity.
+    for (int i = 0; i < 3; ++i) {
+        engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
+    }
+    const auto order = SendOrder(wanted);
+    const std::size_t before_room = config.max_inbound_buffered_chunks_per_entry + ParityChunks(wanted) - 40;
+    SendInOrder(engine, kPeer0, wanted, order, 0, before_room, submitter);
+    const PeerRelayStats waiting = PeerStats(engine, 0);
+    Require(waiting.inbound_rejected == 1, "the block should be counted as refused once");
+    Require(waiting.faults == 0, "a lack of room should not count against the peer");
+    Require(waiting.inbound_entries == 1 && waiting.inbound_decoder_bytes == 0, "the block should wait without a decoder");
+    Require(engine.stats().inbound_evictions == 0, "nothing should be displaced for a waiting block");
+    Require(submitter.submit_calls == 0, "nothing should be submitted yet");
+
+    // Peer 1's block completes and frees the room; the rest of peer 0's chunks complete its block.
+    SendDataChunks(engine, kPeer1, busy, 1, submitter);
+    Require(submitter.submit_calls == 1 && submitter.last_block == busy.bytes, "peer 1's block should complete");
+    SendInOrder(engine, kPeer0, wanted, order, before_room, order.size(), submitter);
+    Require(submitter.submit_calls == 2 && submitter.last_block == wanted.bytes,
+            "the waiting block should complete from the chunks sent after room was freed");
+    Require(PeerStats(engine, 0).faults == 0 && PeerStats(engine, 0).inbound_rejected == 1,
+            "the waiting block should not be counted against the peer or refused again");
+    Require(engine.stats().inbound_evictions == 0, "nothing should have been displaced");
+}
+
+void TestCapacityRefusedHeaderCanBeRetried()
+{
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const TestBlock busy = EncodeTestBlock(600'000, 0xF782, params.data_chunks);
+    const TestBlock wanted = EncodeTestBlock(5000, 0xF783, 20);
+
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_decoder_bytes = photon::fec::Decoder::MemoryBytes(params, busy.bytes.size());
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    engine.OnBlockHeader(kPeer1, HeaderOf(busy), submitter);
+    SendChunks(engine, kPeer1, busy, 0, 1, submitter);
+
+    // Peer 0's header is refused for lack of room, and all of its chunks are kept meanwhile.
+    for (int i = 0; i < 3; ++i) {
+        engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
+    }
+    SendDataChunks(engine, kPeer0, wanted, 0, submitter);
+    Require(submitter.submit_calls == 0 && PeerStats(engine, 0).inbound_decoder_bytes == 0, "the block should wait");
+
+    // Once peer 1's block has completed, a further header copy starts the block from the kept
+    // chunks. A sender sends its header copies before its chunks, and older packets are dropped
+    // before they reach the relay engine, so this order checks the engine on its own.
+    SendDataChunks(engine, kPeer1, busy, 1, submitter);
+    Require(submitter.submit_calls == 1, "peer 1's block should complete");
+    engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
+    Require(submitter.submit_calls == 2 && submitter.last_block == wanted.bytes,
+            "a later header copy should complete the block from its kept chunks");
+    Require(PeerStats(engine, 0).inbound_rejected == 1 && PeerStats(engine, 0).faults == 0,
+            "the waiting block should be counted as refused once and not against the peer");
+}
+
+void TestWaitingBlockEndsOnceItCannotComplete()
+{
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const TestBlock busy = EncodeTestBlock(600'000, 0xF78D, params.data_chunks);
+    const TestBlock wanted = EncodeTestBlock(600'000, 0xF78E, params.data_chunks);
+    const std::size_t charge = photon::fec::Decoder::MemoryBytes(params, wanted.bytes.size());
+    const auto order = SendOrder(wanted);
+
+    // Chunks are lost once the block's own buffer, or the shared pre-header buffer, is full.
+    for (const bool shared_buffer : {false, true}) {
+        MockClock clock{};
+        RelayEngineConfig config{};
+        config.max_inbound_decoder_bytes = charge;
+        if (shared_buffer) {
+            config.max_inbound_buffered_bytes = 8 * photon::fec::FEC_CHUNK_SIZE;
+        }
+        const std::size_t kept = shared_buffer ? 8 : config.max_inbound_buffered_chunks_per_entry;
+        RelayEngine engine(clock, config);
+        CapturingSubmitter submitter;
+        const std::string which = shared_buffer ? " (shared buffer)" : " (own buffer)";
+
+        engine.OnBlockHeader(kPeer1, HeaderOf(busy), submitter);
+        SendChunks(engine, kPeer1, busy, 0, 1, submitter);
+        for (int i = 0; i < 3; ++i) {
+            engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
+        }
+
+        // As many chunks lost as the block has parity chunks: it may still complete.
+        SendInOrder(engine, kPeer0, wanted, order, 0, kept + ParityChunks(wanted), submitter);
+        Require(PeerStats(engine, 0).inbound_entries == 1, "the block should still wait" + which);
+
+        // One more, and some coding group cannot be completed: the block ends, without counting
+        // against the peer or as a further refusal, and holds nothing.
+        SendInOrder(engine, kPeer0, wanted, order, kept + ParityChunks(wanted), kept + ParityChunks(wanted) + 1, submitter);
+        Require(PeerStats(engine, 0).inbound_entries == 0, "a block that cannot complete should end" + which);
+        Require(PeerStats(engine, 0).inbound_rejected == 1 && PeerStats(engine, 0).faults == 0,
+                "the ended block should be counted once and not against the peer" + which);
+
+        // Room frees, but the rest of its chunks are ignored and no decoder is built for it.
+        SendDataChunks(engine, kPeer1, busy, 1, submitter);
+        Require(submitter.submit_calls == 1, "peer 1's block should complete" + which);
+        SendInOrder(engine, kPeer0, wanted, order, kept + ParityChunks(wanted) + 1, order.size(), submitter);
+        Require(submitter.submit_calls == 1 && engine.stats().inbound_entries == 0 && engine.stats().inbound_decoder_bytes == 0,
+                "the rest of the ended block should be ignored" + which);
+    }
+}
+
+void TestHeaderAfterChunksWaitsWithThem()
+{
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const TestBlock busy = EncodeTestBlock(600'000, 0xF78F, params.data_chunks);
+    const TestBlock wanted = EncodeTestBlock(600'000, 0xF790, params.data_chunks);
+    const std::size_t charge = photon::fec::Decoder::MemoryBytes(params, wanted.bytes.size());
+    const auto order = SendOrder(wanted);
+
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_entries_per_peer = 1;
+    config.max_inbound_decoder_bytes = charge;
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    engine.OnBlockHeader(kPeer1, HeaderOf(busy), submitter);
+    SendChunks(engine, kPeer1, busy, 0, 1, submitter);
+
+    // Chunks that reach the engine before their header (not from a sender that follows the
+    // protocol, whose header copies come first) make an entry; when the header is then refused
+    // for lack of room, the block waits in that entry, although peer 0 has no other entry free.
+    SendInOrder(engine, kPeer0, wanted, order, 0, 10, submitter);
+    for (int i = 0; i < 3; ++i) {
+        engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
+    }
+    Require(PeerStats(engine, 0).inbound_entries == 1 && PeerStats(engine, 0).inbound_decoder_bytes == 0,
+            "the block should wait in the entry its chunks made");
+    Require(PeerStats(engine, 0).inbound_rejected == 1, "the block should be counted as refused once");
+    SendInOrder(engine, kPeer0, wanted, order, 10, 100, submitter);
+
+    SendDataChunks(engine, kPeer1, busy, 1, submitter);
+    Require(submitter.submit_calls == 1, "peer 1's block should complete");
+    SendInOrder(engine, kPeer0, wanted, order, 100, order.size(), submitter);
+    Require(submitter.submit_calls == 2 && submitter.last_block == wanted.bytes,
+            "the block should complete with the chunks that came before its header");
+    Require(PeerStats(engine, 0).faults == 0 && engine.stats().inbound_evictions == 0, "nothing should be held against anyone");
+}
+
+void TestStartingWaitingBlockIsNotProgress()
+{
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const TestBlock busy = EncodeTestBlock(600'000, 0xF791, params.data_chunks);
+    const TestBlock wanted = EncodeTestBlock(600'000, 0xF792, params.data_chunks);
+    const TestBlock later = EncodeTestBlock(600'000, 0xF793, params.data_chunks);
+    const std::size_t charge = photon::fec::Decoder::MemoryBytes(params, wanted.bytes.size());
+
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_decoder_bytes = charge;
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    engine.OnBlockHeader(kPeer1, HeaderOf(busy), submitter);
+    SendChunks(engine, kPeer1, busy, 0, 1, submitter);
+    engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
+    SendChunks(engine, kPeer0, wanted, 0, 10, submitter);
+
+    // Long after peer 0's last new chunk, room frees and a further header copy starts its block
+    // (an order that checks the engine on its own: a sender's header copies come first).
+    clock.Advance(config.inbound_progress_grace + std::chrono::milliseconds{1});
+    SendDataChunks(engine, kPeer1, busy, 1, submitter);
+    Require(submitter.submit_calls == 1, "peer 1's block should complete");
+    engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
+    Require(PeerStats(engine, 0).inbound_decoder_bytes == charge, "the repeated header copy should start the block");
+
+    // That start is not progress: the block is still idle, so another peer's new block may displace it.
+    engine.OnBlockHeader(kPeer2, HeaderOf(later), submitter);
+    Require(PeerStats(engine, 0).inbound_evictions == 1, "the idle started block should be displaced");
+    Require(PeerStats(engine, 2).inbound_decoder_bytes == charge, "the new block should get the room");
+}
+
+void TestWaitingBlockTakesNothingFromOtherBlocks()
+{
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const TestBlock busy = EncodeTestBlock(600'000, 0xF784, params.data_chunks);
+    const TestBlock wanted = EncodeTestBlock(600'000, 0xF785, params.data_chunks);
+    const std::size_t charge = photon::fec::Decoder::MemoryBytes(params, wanted.bytes.size());
+
+    {
+        // Peer 0 has no free entry: the header is refused like any other, and its chunks displace
+        // none of peer 0's blocks.
+        MockClock clock{};
+        RelayEngineConfig config{};
+        config.max_inbound_entries_per_peer = 2;
+        config.max_inbound_decoder_bytes = charge;
+        RelayEngine engine(clock, config);
+        CapturingSubmitter submitter;
+
+        engine.OnBlockHeader(kPeer1, HeaderOf(busy), submitter);
+        const TestBlock pending1 = EncodeTestBlock(100, 0xF786);
+        const TestBlock pending2 = EncodeTestBlock(100, 0xF787);
+        SendChunks(engine, kPeer0, pending1, 0, 1, submitter);
+        SendChunks(engine, kPeer0, pending2, 0, 1, submitter);
+
+        for (int i = 0; i < 3; ++i) {
+            engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
+        }
+        SendChunks(engine, kPeer0, wanted, 0, 100, submitter);
+        Require(engine.stats().inbound_evictions == 0, "nothing should be evicted for a refused block");
+        Require(PeerStats(engine, 0).inbound_entries == 2, "peer 0 should keep its own blocks");
+        Require(PeerStats(engine, 0).inbound_rejected == 1, "the refused block's other packets should be ignored");
+        Require(engine.stats().inbound_entries == 3, "the refused block should hold no entry");
+    }
+
+    {
+        // A waiting block looks for room again after a block is released, but takes only room that
+        // is free: it does not displace another peer's block, even one idle long enough that a
+        // new header would.
+        MockClock clock{};
+        RelayEngineConfig config{};
+        config.max_inbound_entries_per_peer = 1;
+        config.max_inbound_decoder_bytes = charge;
+        RelayEngine engine(clock, config);
+        CapturingSubmitter submitter;
+
+        engine.OnBlockHeader(kPeer1, HeaderOf(busy), submitter);
+        SendChunks(engine, kPeer1, busy, 0, 1, submitter);
+        engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
+        Require(PeerStats(engine, 0).inbound_entries == 1 && PeerStats(engine, 0).inbound_decoder_bytes == 0,
+                "the block should wait");
+
+        clock.Advance(config.inbound_progress_grace + std::chrono::milliseconds{1});
+        // Peer 2's second pre-header block displaces its first: a release that frees no decoder memory.
+        const TestBlock other1 = EncodeTestBlock(100, 0xF788);
+        const TestBlock other2 = EncodeTestBlock(100, 0xF789);
+        SendChunks(engine, kPeer2, other1, 0, 1, submitter);
+        SendChunks(engine, kPeer2, other2, 0, 1, submitter);
+        Require(PeerStats(engine, 2).inbound_evictions == 1, "peer 2 should have released a block");
+
+        SendChunks(engine, kPeer0, wanted, 0, 10, submitter);
+        Require(PeerStats(engine, 1).inbound_evictions == 0, "peer 1's idle block must not be displaced for a waiting block");
+        Require(PeerStats(engine, 0).inbound_decoder_bytes == 0, "the block should still wait");
+
+        // Peer 1's block completes; peer 0's next chunk starts the waiting block, and the rest complete it.
+        SendDataChunks(engine, kPeer1, busy, 1, submitter);
+        Require(submitter.submit_calls == 1, "peer 1's block should complete");
+        SendChunks(engine, kPeer0, wanted, 10, 11, submitter);
+        Require(PeerStats(engine, 0).inbound_decoder_bytes == charge, "the first chunk after the release should start the block");
+        SendChunks(engine, kPeer0, wanted, 11, wanted.encoded.chunks.size(), submitter);
+        Require(submitter.submit_calls == 2 && submitter.last_block == wanted.bytes, "the waiting block should complete");
+        Require(engine.stats().inbound_evictions == 1, "only peer 2's own block should have been displaced");
+    }
+}
+
+void TestNeverFittingDecoderFinishesBlock()
+{
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const TestBlock block = EncodeTestBlock(600'000, 0xF78A, params.data_chunks);
+    const std::size_t charge = photon::fec::Decoder::MemoryBytes(params, block.bytes.size());
+
+    for (const bool per_peer : {true, false}) {
+        MockClock clock{};
+        RelayEngineConfig config{};
+        (per_peer ? config.max_inbound_decoder_bytes_per_peer : config.max_inbound_decoder_bytes) = charge - 1;
+        RelayEngine engine(clock, config);
+        CapturingSubmitter submitter;
+
+        // A decoder above the peer's or the total cap can never be built: the block ends there,
+        // without counting against the peer, and the rest of it from that peer is ignored.
+        const std::string cap = per_peer ? "per-peer" : "total";
+        for (int i = 0; i < 3; ++i) {
+            engine.OnBlockHeader(kPeer0, HeaderOf(block), submitter);
+        }
+        Require(engine.stats().inbound_entries == 0, "a header above the " + cap + " cap should not be kept");
+        SendDataChunks(engine, kPeer0, block, 0, submitter);
+        Require(PeerStats(engine, 0).inbound_rejected == 1, "a block above the " + cap + " cap should be refused once");
+        Require(PeerStats(engine, 0).faults == 0, "a block above the " + cap + " cap should not count against the peer");
+        Require(engine.stats().inbound_entries == 0, "a block above the " + cap + " cap should leave no state");
+        Require(submitter.submit_calls == 0, "a block above the " + cap + " cap should not be submitted");
+    }
+}
+
+void TestWaitingBlockChunkMustFitItsHeader()
+{
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const TestBlock busy = EncodeTestBlock(600'000, 0xF78B, params.data_chunks);
+    const TestBlock wanted = EncodeTestBlock(5000, 0xF78C, 20); // one coding group
+
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_decoder_bytes = photon::fec::Decoder::MemoryBytes(params, busy.bytes.size());
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    engine.OnBlockHeader(kPeer1, HeaderOf(busy), submitter);
+    engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
+    Require(PeerStats(engine, 0).inbound_entries == 1, "the block should wait");
+
+    // The header is known, so a chunk outside it counts against the peer and ends the block.
+    BlockChunkPayload outside = BuildChunkPayload(wanted.encoded.chunks[0], wanted.prefix);
+    outside.coding_group_id = 1;
+    engine.OnBlockChunk(kPeer0, outside, submitter);
+    Require(PeerStats(engine, 0).faults == 1, "a chunk outside the kept header should count against the peer");
+    Require(PeerStats(engine, 0).inbound_entries == 0, "the block should be dropped");
+
+    // Its remaining chunks are ignored, even once there is room.
+    SendDataChunks(engine, kPeer1, busy, 0, submitter);
+    SendDataChunks(engine, kPeer0, wanted, 0, submitter);
+    engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
+    Require(submitter.submit_calls == 1, "only peer 1's block should be submitted");
+    Require(PeerStats(engine, 0).inbound_rejected == 2, "only the header and the chunk outside it should be refused");
+}
+
+void TestFaultRefusedHeaderStaysHandled()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    const TestBlock block = EncodeTestBlock(5000, 0xF790, 20);
+    BlockHeaderPayload malformed = BuildHeaderPayload(block.encoded, block.prefix, block.bytes.size());
+    ++malformed.coding_group_count;
+    engine.OnBlockHeader(kPeer0, malformed, submitter);
+    Require(PeerStats(engine, 0).inbound_rejected == 1 && PeerStats(engine, 0).faults == 1,
+            "the malformed header should be refused and count against the peer");
+
+    // The rest of that block from the same peer is ignored, a well-formed header copy included.
+    DeliverBlock(engine, kPeer0, block, submitter);
+    Require(submitter.submit_calls == 0, "the block should not be started from the same peer");
+    Require(engine.stats().inbound_entries == 0, "its chunks should not be buffered");
+    Require(PeerStats(engine, 0).inbound_rejected == 1 && PeerStats(engine, 0).faults == 1,
+            "its later packets should be ignored, not refused or counted again");
+
+    // Another peer's copy is still used.
+    DeliverBlock(engine, kPeer1, block, submitter);
+    Require(submitter.submit_calls == 1 && submitter.last_block == block.bytes, "another peer's copy should be used");
 }
 
 void TestNodeAnsweredBlockStillRelayedOut()
@@ -2847,6 +3255,15 @@ int RunAllTests()
         {"repeated_chunks_do_not_keep_block_alive", TestRepeatedChunksDoNotKeepBlockAlive},
         {"combined_limits_evict_nothing_when_refused", TestCombinedLimitsEvictNothingWhenRefused},
         {"refused_header_remaining_chunks_ignored", TestRefusedHeaderRemainingChunksIgnored},
+        {"capacity_refused_block_completes_in_sender_order", TestCapacityRefusedBlockCompletesInSenderOrder},
+        {"capacity_refused_header_can_be_retried", TestCapacityRefusedHeaderCanBeRetried},
+        {"waiting_block_ends_once_it_cannot_complete", TestWaitingBlockEndsOnceItCannotComplete},
+        {"header_after_chunks_waits_with_them", TestHeaderAfterChunksWaitsWithThem},
+        {"starting_waiting_block_is_not_progress", TestStartingWaitingBlockIsNotProgress},
+        {"waiting_block_takes_nothing_from_other_blocks", TestWaitingBlockTakesNothingFromOtherBlocks},
+        {"never_fitting_decoder_finishes_block", TestNeverFittingDecoderFinishesBlock},
+        {"waiting_block_chunk_must_fit_its_header", TestWaitingBlockChunkMustFitItsHeader},
+        {"fault_refused_header_stays_handled", TestFaultRefusedHeaderStaysHandled},
         {"node_answered_block_still_relayed_out", TestNodeAnsweredBlockStillRelayedOut},
         {"unavailable_check_not_repeated_for_copies", TestUnavailableCheckNotRepeatedForCopies},
         {"rejected_copy_does_not_block_other_peers_copy", TestRejectedCopyDoesNotBlockOtherPeersCopy},

@@ -278,6 +278,13 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
         // so already ingested chunks are not discarded by decoder re-creation.
         return;
     }
+    if (existing != m_inbound.end() && existing->second.waiting.has_value()) {
+        // Another copy of a header kept while its block waits for room: the kept one stands.
+        if (StartIfRoom(key, existing->second, now)) {
+            TryFinalizeInbound(key, existing->second, submitter);
+        }
+        return;
+    }
 
     if (IsSuspended(slot, now)) {
         RejectInbound(slot);
@@ -337,32 +344,37 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
     }
 
     if (!MakeRoom(key, /*new_entry=*/existing == m_inbound.end(), decoder_bytes, now)) {
-        refuse(/*fault=*/false);
+        // Not the peer's fault. Unless its decoder could never fit, the header is kept with the
+        // block's pre-header entry so that its chunks can start the block once there is room (see
+        // StartIfRoom). A new entry is made for it only if one is free without displacing anything;
+        // otherwise the header is refused like any other.
+        const PeerInbound& peer = Peer(slot);
+        const bool could_fit = decoder_bytes <= m_config.max_inbound_decoder_bytes_per_peer &&
+                               decoder_bytes <= m_config.max_inbound_decoder_bytes;
+        const bool has_entry = existing != m_inbound.end() ||
+                               (peer.entries < m_config.max_inbound_entries_per_peer &&
+                                m_inbound.size() < m_config.max_inbound_entries);
+        if (!could_fit || !has_entry) {
+            refuse(/*fault=*/false);
+            return;
+        }
+        RejectInbound(slot);
+        InboundRelay& relay = existing != m_inbound.end() ? existing->second : CreateInbound(key, now);
+        relay.waiting = WaitingHeader{
+            .params = params,
+            .original_size = original_size,
+            .coding_group_count = expected_group_count,
+            .decoder_bytes = decoder_bytes,
+            .releases = m_inbound_releases,
+        };
         return;
     }
     existing = m_inbound.find(key);
     InboundRelay& relay = existing != m_inbound.end() ? existing->second : CreateInbound(key, now);
-
-    try {
-        relay.decoder.emplace(params, original_size);
-    } catch (const std::exception&) {
-        relay.decoder.reset();
-        refuse(/*fault=*/false);
-        return;
-    }
-    relay.params = params;
     relay.last_updated = now;
-    ChargeDecoder(key, relay, decoder_bytes);
-
-    for (const fec::Chunk& chunk : relay.buffered_chunks) {
-        if (!relay.decoder->AddChunk(chunk)) {
-            refuse(/*fault=*/true);
-            return;
-        }
+    if (StartDecoder(key, relay, params, original_size, decoder_bytes, now)) {
+        TryFinalizeInbound(key, relay, submitter);
     }
-    ClearBufferedChunks(relay);
-
-    TryFinalizeInbound(key, relay, submitter);
 }
 
 void RelayEngine::OnBlockChunk(const BlockChunkPayload& payload, BlockSubmitter& submitter)
@@ -395,7 +407,8 @@ void RelayEngine::OnBlockChunk(const InboundPeerInfo& inbound_peer,
     }
     InboundRelay& relay = it->second;
 
-    const bool relay_remains = FeedChunk(key, relay, payload);
+    // A block waiting for room may start now, with this chunk.
+    const bool relay_remains = StartIfRoom(key, relay, now) && FeedChunk(key, relay, payload);
     ++m_stats.chunks_received;
     if (!relay_remains) {
         return;
@@ -731,6 +744,61 @@ void RelayEngine::ChargeDecoder(const InboundRelayKey& key, InboundRelay& relay,
     UpdateUsageStats();
 }
 
+bool RelayEngine::StartDecoder(const InboundRelayKey& key,
+                               InboundRelay& relay,
+                               fec::Parameters params,
+                               std::size_t original_size,
+                               std::size_t decoder_bytes,
+                               Clock::TimePoint now)
+{
+    // Either way the rest of the block's chunks from this peer are then ignored; a buffered chunk
+    // that does not fit also counts against the peer.
+    const auto drop = [&](bool fault) {
+        RejectInbound(key.slot_index);
+        EraseInbound(key);
+        MarkFinished(key, now);
+        if (fault) {
+            RecordFault(key.slot_index, now);
+        }
+        return false;
+    };
+
+    try {
+        relay.decoder.emplace(params, original_size);
+    } catch (const std::exception&) {
+        relay.decoder.reset();
+        return drop(/*fault=*/false);
+    }
+    relay.waiting.reset();
+    relay.params = params;
+    ChargeDecoder(key, relay, decoder_bytes);
+
+    for (const fec::Chunk& chunk : relay.buffered_chunks) {
+        if (!relay.decoder->AddChunk(chunk)) {
+            return drop(/*fault=*/true);
+        }
+    }
+    ClearBufferedChunks(relay);
+    return true;
+}
+
+bool RelayEngine::StartIfRoom(const InboundRelayKey& key, InboundRelay& relay, Clock::TimePoint now)
+{
+    // Room is only ever freed by releasing an incomplete block.
+    if (!relay.waiting.has_value() || relay.waiting->releases == m_inbound_releases) {
+        return true;
+    }
+    relay.waiting->releases = m_inbound_releases;
+
+    const WaitingHeader header = *relay.waiting;
+    const PeerInbound& peer = Peer(key.slot_index);
+    if (peer.decoder_bytes + header.decoder_bytes > m_config.max_inbound_decoder_bytes_per_peer ||
+        m_inbound_decoder_bytes + header.decoder_bytes > m_config.max_inbound_decoder_bytes) {
+        return true;
+    }
+    return StartDecoder(key, relay, header.params, header.original_size, header.decoder_bytes, now);
+}
+
 void RelayEngine::MarkFinished(const InboundRelayKey& key, Clock::TimePoint now)
 {
     m_finished.Insert(key, now);
@@ -797,6 +865,7 @@ RelayEngine::InboundMap::iterator RelayEngine::EraseInboundAt(InboundMap::iterat
     }
 
     auto next = m_inbound.erase(it);
+    ++m_inbound_releases;
     UpdateUsageStats();
     return next;
 }
@@ -1162,8 +1231,23 @@ bool RelayEngine::FeedChunk(const InboundRelayKey& key, InboundRelay& relay, con
     chunk.chunk_id = payload.chunk_id;
     chunk.bytes = payload.chunk_data;
 
+    // A chunk that does not fit the announced block: drop the block and count it against the peer.
+    const auto drop_block = [&] {
+        RejectInbound(key.slot_index);
+        EraseInbound(key);
+        MarkFinished(key, now);
+        RecordFault(key.slot_index, now);
+        return false;
+    };
+
     if (!relay.decoder.has_value()) {
-        if (relay.buffered_chunks.size() >= m_config.max_inbound_buffered_chunks_per_entry) {
+        // The chunks of a block whose header waits for room must fit that header.
+        const bool waiting = relay.waiting.has_value();
+        if (waiting && (chunk.coding_group_id >= relay.waiting->coding_group_count || chunk.chunk_id >= fec::FEC_TOTAL_CHUNKS)) {
+            return drop_block();
+        }
+        const bool full = relay.buffered_chunks.size() >= m_config.max_inbound_buffered_chunks_per_entry;
+        if (full && !waiting) {
             RejectInbound(key.slot_index);
             return true;
         }
@@ -1174,8 +1258,23 @@ bool RelayEngine::FeedChunk(const InboundRelayKey& key, InboundRelay& relay, con
             // Not progress, and nothing new to keep.
             return true;
         }
-        if (!HasGlobalInboundBufferCapacity()) {
-            RejectInbound(key.slot_index);
+        if (full || !HasGlobalInboundBufferCapacity()) {
+            if (!waiting) {
+                RejectInbound(key.slot_index);
+                return true;
+            }
+            // A waiting block was counted as refused once, for its header; the chunks it cannot
+            // keep are not counted again. A sender sends each chunk once, so once more of them
+            // are lost here than all its coding groups have parity chunks, some group can no
+            // longer be completed: the block then ends as if its header had been refused.
+            WaitingHeader& header = *relay.waiting;
+            ++header.dropped;
+            const std::size_t parity_per_group = static_cast<std::size_t>(header.params.total_chunks - header.params.data_chunks);
+            if (header.dropped > header.coding_group_count * parity_per_group) {
+                EraseInbound(key);
+                MarkFinished(key, now);
+                return false;
+            }
             return true;
         }
 
@@ -1188,12 +1287,7 @@ bool RelayEngine::FeedChunk(const InboundRelayKey& key, InboundRelay& relay, con
 
     const std::size_t received_before = relay.decoder->ReceivedChunkCount();
     if (!relay.decoder->AddChunk(chunk)) {
-        // A chunk that does not fit the announced block: drop the block and count it against the peer.
-        RejectInbound(key.slot_index);
-        EraseInbound(key);
-        MarkFinished(key, now);
-        RecordFault(key.slot_index, now);
-        return false;
+        return drop_block();
     }
     // Only new chunks count as progress; repeats do not keep a block alive.
     if (relay.decoder->ReceivedChunkCount() != received_before) {
